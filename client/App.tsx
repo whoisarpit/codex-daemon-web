@@ -49,6 +49,13 @@ import "./styles.css";
 
 type TimelineItem = ThreadItemEntry & { streaming?: boolean };
 type ThreadTrailEntry = { id: string; title: string };
+type ConversationRoute = { kind: "new" } | { kind: "thread"; threadId: string };
+type ConversationHistoryState = {
+  codexDeskRoute: true;
+  routeHash: string;
+  threadTrail: ThreadTrailEntry[];
+  parentRoute?: string;
+};
 type PendingUpload = {
   id: string;
   name: string;
@@ -63,6 +70,97 @@ const maxAttachmentBytes = 700 * 1024;
 const maxCompressedImageBytes = 320 * 1024;
 const maxImageFileBytes = 20 * 1024 * 1024;
 const maxImageCount = 4;
+
+function routeHash(route: ConversationRoute): string {
+  return route.kind === "new"
+    ? "#/new"
+    : `#/thread/${encodeURIComponent(route.threadId)}`;
+}
+
+function parseRouteHash(hash: string): {
+  route: ConversationRoute | null;
+  invalid: boolean;
+} {
+  if (!hash) return { route: null, invalid: false };
+  if (hash === "#/new") return { route: { kind: "new" }, invalid: false };
+  const prefix = "#/thread/";
+  if (!hash.startsWith(prefix)) return { route: null, invalid: true };
+  const encodedId = hash.slice(prefix.length);
+  if (!encodedId || encodedId.includes("/"))
+    return { route: null, invalid: true };
+  try {
+    const threadId = decodeURIComponent(encodedId);
+    if (!threadId || /[\u0000-\u001f\u007f]/.test(threadId))
+      return { route: null, invalid: true };
+    return { route: { kind: "thread", threadId }, invalid: false };
+  } catch {
+    return { route: null, invalid: true };
+  }
+}
+
+function historyStateFor(
+  route: ConversationRoute,
+  threadTrail: ThreadTrailEntry[],
+  parentRoute?: string,
+): ConversationHistoryState {
+  return {
+    codexDeskRoute: true,
+    routeHash: routeHash(route),
+    threadTrail,
+    ...(parentRoute ? { parentRoute } : {}),
+  };
+}
+
+function writeHistoryRoute(
+  route: ConversationRoute,
+  threadTrail: ThreadTrailEntry[],
+  mode: "push" | "replace",
+  parentRoute?: string,
+): void {
+  const hash = routeHash(route);
+  const url = `${window.location.pathname}${window.location.search}${hash}`;
+  const state = historyStateFor(route, threadTrail, parentRoute);
+  if (mode === "push" && window.location.hash !== hash)
+    window.history.pushState(state, "", url);
+  else window.history.replaceState(state, "", url);
+}
+
+function readHistoryState(
+  value: unknown,
+  expectedHash: string,
+): ConversationHistoryState | null {
+  const expectedRoute = parseRouteHash(expectedHash);
+  if (
+    !isRecord(value) ||
+    value.codexDeskRoute !== true ||
+    value.routeHash !== expectedHash ||
+    !expectedRoute.route
+  )
+    return null;
+  const threadTrail = Array.isArray(value.threadTrail)
+    ? value.threadTrail.filter(
+        (entry): entry is ThreadTrailEntry =>
+          isRecord(entry) &&
+          typeof entry.id === "string" &&
+          Boolean(entry.id) &&
+          typeof entry.title === "string",
+      )
+    : [];
+  const parsedParent =
+    typeof value.parentRoute === "string"
+      ? parseRouteHash(value.parentRoute)
+      : null;
+  const parentRoute =
+    parsedParent?.route?.kind === "thread"
+      ? routeHash(parsedParent.route)
+      : undefined;
+  return {
+    codexDeskRoute: true,
+    routeHash: expectedHash,
+    threadTrail,
+    ...(parentRoute ? { parentRoute } : {}),
+  };
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -285,11 +383,56 @@ export default function App() {
   const [selectedThread, setSelectedThread] = useState<ThreadSummary | null>(
     null,
   );
-  const [threadTrail, setThreadTrail] = useState<ThreadTrailEntry[]>([]);
   const [threadDetails, setThreadDetails] = useState<ThreadDetails | null>(
     null,
   );
   const selectedRef = useRef<string | null>(null);
+  const initialNavigationRef = useRef<{
+    route: ConversationRoute;
+    invalid: boolean;
+    threadTrail: ThreadTrailEntry[];
+    parentRoute?: string;
+  } | null>(null);
+  if (!initialNavigationRef.current) {
+    const parsed = parseRouteHash(window.location.hash);
+    const savedThread = sessionStorage.getItem(selectedThreadKey);
+    const route =
+      parsed.route ??
+      (parsed.invalid || !savedThread
+        ? { kind: "new" as const }
+        : { kind: "thread" as const, threadId: savedThread });
+    const storedHistoryState = readHistoryState(
+      window.history.state,
+      routeHash(route),
+    );
+    initialNavigationRef.current = {
+      route,
+      invalid: parsed.invalid,
+      threadTrail: storedHistoryState?.threadTrail ?? [],
+      parentRoute: storedHistoryState?.parentRoute,
+    };
+  }
+  const [route, setRoute] = useState(initialNavigationRef.current.route);
+  const routeRef = useRef(route);
+  const historyHandledRef = useRef("");
+  const navigationInitializedRef = useRef(false);
+  const [threadTrail, setThreadTrail] = useState<ThreadTrailEntry[]>(
+    initialNavigationRef.current.threadTrail,
+  );
+  const threadTrailRef = useRef(threadTrail);
+  const updateThreadTrail = useCallback(
+    (
+      next:
+        | ThreadTrailEntry[]
+        | ((current: ThreadTrailEntry[]) => ThreadTrailEntry[]),
+    ) => {
+      const value =
+        typeof next === "function" ? next(threadTrailRef.current) : next;
+      threadTrailRef.current = value;
+      setThreadTrail(value);
+    },
+    [],
+  );
   const [items, setItems] = useState<TimelineItem[]>([]);
   const itemsRef = useRef<TimelineItem[]>([]);
   const liveItemsRef = useRef(new Set<string>());
@@ -337,7 +480,9 @@ export default function App() {
   const sessionProbeInFlightRef = useRef<number | null>(null);
   const sessionProbeLastAtRef = useRef(0);
   const approvalPrompt = approvalQueue[0] ?? null;
-  const newConversationRef = useRef<() => void>(() => {});
+  const newConversationRef = useRef<
+    (historyMode?: "push" | "replace" | "none") => void
+  >(() => {});
 
   useEffect(() => {
     if (connection !== "online") {
@@ -385,6 +530,31 @@ export default function App() {
     }
   }, []);
 
+  useEffect(() => {
+    if (navigationInitializedRef.current) return;
+    const initial = initialNavigationRef.current!;
+    routeRef.current = initial.route;
+    selectedRef.current =
+      initial.route.kind === "thread" ? initial.route.threadId : null;
+    updateThreadTrail(initial.threadTrail);
+    writeHistoryRoute(
+      initial.route,
+      initial.threadTrail,
+      "replace",
+      initial.parentRoute,
+    );
+    historyHandledRef.current = `${window.location.href}|${JSON.stringify(window.history.state)}`;
+    if (initial.route.kind === "thread")
+      sessionStorage.setItem(selectedThreadKey, initial.route.threadId);
+    else sessionStorage.removeItem(selectedThreadKey);
+    if (initial.invalid)
+      setNotice({
+        tone: "error",
+        text: "That conversation link is not valid.",
+      });
+    navigationInitializedRef.current = true;
+  }, [updateThreadTrail]);
+
   const handleSessionExpired = useCallback(() => {
     if (sessionExpiredRef.current) return;
     sessionExpiredRef.current = true;
@@ -393,6 +563,12 @@ export default function App() {
     ++loadVersionRef.current;
     detach();
     selectedRef.current = null;
+    const newRoute: ConversationRoute = { kind: "new" };
+    routeRef.current = newRoute;
+    setRoute(newRoute);
+    updateThreadTrail([]);
+    writeHistoryRoute(newRoute, [], "replace");
+    historyHandledRef.current = `${window.location.href}|${JSON.stringify(window.history.state)}`;
     sessionStorage.removeItem(selectedThreadKey);
     setStatus({ authenticated: false, daemon: { available: false } });
     setStatusError("");
@@ -402,7 +578,6 @@ export default function App() {
     setToken("");
     setThreads([]);
     threadsRef.current = [];
-    setThreadTrail([]);
     setSelectedThread(null);
     setThreadDetails(null);
     setItems([]);
@@ -423,7 +598,7 @@ export default function App() {
     setSending(false);
     setInterrupting(false);
     setShowSettings(false);
-  }, [detach]);
+  }, [detach, updateThreadTrail]);
 
   const checkSessionAfterDisconnect = useCallback(() => {
     if (
@@ -750,6 +925,7 @@ export default function App() {
               preview?: string;
               cwd?: string;
               canAcceptDirectInput?: boolean | null;
+              parentThreadId?: string | null;
             };
           }
         >("thread/resume", {
@@ -808,6 +984,36 @@ export default function App() {
             preview: response.thread.preview ?? existing?.preview ?? "",
           };
         });
+        if (
+          response.thread.parentThreadId &&
+          response.thread.parentThreadId !== threadId &&
+          threadTrailRef.current.length === 0 &&
+          routeRef.current.kind === "thread" &&
+          routeRef.current.threadId === threadId
+        ) {
+          const parentId = response.thread.parentThreadId;
+          const parent = threadsRef.current.find(
+            (thread) => thread.id === parentId,
+          );
+          const trail = [
+            {
+              id: parentId,
+              title: parent ? titleFor(parent) : "Parent conversation",
+            },
+          ];
+          updateThreadTrail(trail);
+          const currentHistoryState = readHistoryState(
+            window.history.state,
+            routeHash(routeRef.current),
+          );
+          writeHistoryRoute(
+            routeRef.current,
+            trail,
+            "replace",
+            currentHistoryState?.parentRoute,
+          );
+          historyHandledRef.current = `${window.location.href}|${JSON.stringify(window.history.state)}`;
+        }
 
         const [page, turnPage] = await Promise.all([
           rpc.request<{ data: ThreadItemEntry[]; nextCursor: string | null }>(
@@ -856,53 +1062,126 @@ export default function App() {
         });
       }
     },
-    [],
+    [updateThreadTrail],
+  );
+
+  const navigateToThread = useCallback(
+    (
+      threadId: string,
+      trail: ThreadTrailEntry[],
+      historyMode: "push" | "replace" | "none" = "push",
+      parentRoute?: string,
+    ) => {
+      const nextRoute: ConversationRoute = { kind: "thread", threadId };
+      if (historyMode !== "none")
+        writeHistoryRoute(nextRoute, trail, historyMode, parentRoute);
+      routeRef.current = nextRoute;
+      setRoute(nextRoute);
+      updateThreadTrail(trail);
+      selectedRef.current = threadId;
+      sessionStorage.setItem(selectedThreadKey, threadId);
+      historyHandledRef.current = `${window.location.href}|${JSON.stringify(window.history.state)}`;
+
+      if (
+        client &&
+        connection === "online" &&
+        status?.authenticated &&
+        status.daemon.available
+      )
+        return openThread(client, threadId, historyMode === "push");
+
+      ++loadVersionRef.current;
+      setSelectedThread(null);
+      setThreadDetails(null);
+      setItems([]);
+      itemsRef.current = [];
+      liveItemsRef.current.clear();
+      setItemCursor(null);
+      setLoadingThread(true);
+      setActiveTurnId(null);
+      setTurnActive(false);
+      return undefined;
+    },
+    [
+      client,
+      connection,
+      openThread,
+      status?.authenticated,
+      status?.daemon.available,
+      updateThreadTrail,
+    ],
   );
 
   const openAgentThread = useCallback(
     (threadId: string, parentThreadId?: string) => {
       const parentId = parentThreadId || selectedThread?.id;
       if (
-        !client ||
         !selectedThread ||
         !parentId ||
         !threadId ||
         threadId === selectedThread.id ||
+        (parentThreadId && parentThreadId !== selectedThread.id) ||
         loadingThread ||
         threadNavigationRef.current
       )
         return;
       threadNavigationRef.current = true;
-      const parentSummary =
-        selectedThread.id === parentId
-          ? selectedThread
-          : threadsRef.current.find((thread) => thread.id === parentId);
-      setThreadTrail((current) => [
-        ...current,
+      const parentTrail = [
+        ...threadTrailRef.current,
         {
           id: parentId,
-          title: parentSummary
-            ? titleFor(parentSummary)
-            : "Parent conversation",
+          title: titleFor(selectedThread),
         },
-      ]);
-      void openThread(client, threadId, true).finally(() => {
-        threadNavigationRef.current = false;
-      });
+      ];
+      const parentRoute = routeHash(routeRef.current);
+      const navigation = navigateToThread(
+        threadId,
+        parentTrail,
+        "push",
+        parentRoute,
+      );
+      if (navigation)
+        void navigation.finally(() => {
+          threadNavigationRef.current = false;
+        });
+      else threadNavigationRef.current = false;
     },
-    [client, loadingThread, openThread, selectedThread],
+    [loadingThread, navigateToThread, selectedThread],
   );
 
   const returnToParentThread = useCallback(() => {
     const parent = threadTrail.at(-1);
-    if (!client || !parent || loadingThread || threadNavigationRef.current)
-      return;
-    threadNavigationRef.current = true;
-    setThreadTrail((current) => current.slice(0, -1));
-    void openThread(client, parent.id, true).finally(() => {
-      threadNavigationRef.current = false;
+    if (!parent || loadingThread || threadNavigationRef.current) return;
+    const expectedParentRoute = routeHash({
+      kind: "thread",
+      threadId: parent.id,
     });
-  }, [client, loadingThread, openThread, threadTrail]);
+    const currentState = readHistoryState(
+      window.history.state,
+      routeHash(routeRef.current),
+    );
+    if (currentState?.parentRoute === expectedParentRoute) {
+      window.history.back();
+      return;
+    }
+    threadNavigationRef.current = true;
+    const parentTrail = threadTrailRef.current.slice(0, -1);
+    const parentOfParent = parentTrail.at(-1);
+    const parentRoute = parentOfParent
+      ? routeHash({ kind: "thread", threadId: parentOfParent.id })
+      : undefined;
+    const navigation = navigateToThread(
+      parent.id,
+      parentTrail,
+      "push",
+      parentRoute,
+    );
+    if (navigation)
+      void navigation.finally(() => {
+        threadNavigationRef.current = false;
+      });
+    else threadNavigationRef.current = false;
+  }, [loadingThread, navigateToThread, threadTrail]);
 
   const onReady = useCallback(
     (rpc: RpcClient) => {
@@ -912,11 +1191,8 @@ export default function App() {
       sessionExpiredRef.current = false;
       void loadModels(rpc);
       void refreshThreads(rpc, archivedThreads, false);
-      if (selectedRef.current) void openThread(rpc, selectedRef.current, false);
-      else {
-        const saved = sessionStorage.getItem(selectedThreadKey);
-        if (saved) void openThread(rpc, saved, false);
-      }
+      if (routeRef.current.kind === "thread")
+        void openThread(rpc, routeRef.current.threadId, false);
     },
     [archivedThreads, loadModels, openThread, refreshThreads],
   );
@@ -992,34 +1268,50 @@ export default function App() {
       });
     } finally {
       detach();
+      ++loadVersionRef.current;
       selectedRef.current = null;
-      setThreadTrail([]);
+      const newRoute: ConversationRoute = { kind: "new" };
+      routeRef.current = newRoute;
+      setRoute(newRoute);
+      updateThreadTrail([]);
+      writeHistoryRoute(newRoute, [], "replace");
+      historyHandledRef.current = `${window.location.href}|${JSON.stringify(window.history.state)}`;
       setStatus({ authenticated: false, daemon: { available: false } });
       setThreads([]);
       setSelectedThread(null);
       setThreadDetails(null);
       setItems([]);
+      itemsRef.current = [];
+      setLoadingThread(false);
       sessionStorage.removeItem(selectedThreadKey);
     }
   };
 
   const chooseThread = (thread: ThreadSummary) => {
-    if (!client) return;
     threadNavigationRef.current = false;
-    setThreadTrail([]);
-    void openThread(client, thread.id, true);
+    navigateToThread(thread.id, [], "push");
   };
 
-  const newConversation = () => {
+  const newConversation = (
+    historyMode: "push" | "replace" | "none" = "push",
+  ) => {
+    const newRoute: ConversationRoute = { kind: "new" };
+    if (historyMode !== "none") writeHistoryRoute(newRoute, [], historyMode);
+    routeRef.current = newRoute;
+    setRoute(newRoute);
+    updateThreadTrail([]);
+    historyHandledRef.current = `${window.location.href}|${JSON.stringify(window.history.state)}`;
     ++loadVersionRef.current;
     threadNavigationRef.current = false;
-    setThreadTrail([]);
     selectedRef.current = null;
     sessionStorage.removeItem(selectedThreadKey);
     setSelectedThread(null);
     setThreadDetails(null);
     setItems([]);
+    itemsRef.current = [];
+    liveItemsRef.current.clear();
     setItemCursor(null);
+    setLoadingThread(false);
     setActiveTurnId(null);
     setTurnActive(false);
     setApprovalPolicy("");
@@ -1041,6 +1333,47 @@ export default function App() {
     setMobileSidebarOpen(false);
   };
   newConversationRef.current = newConversation;
+
+  useEffect(() => {
+    const handleLocationChange = () => {
+      if (!navigationInitializedRef.current) return;
+      const locationKey = `${window.location.href}|${JSON.stringify(window.history.state)}`;
+      if (historyHandledRef.current === locationKey) return;
+      threadNavigationRef.current = false;
+      const parsed = parseRouteHash(window.location.hash);
+      if (!parsed.route) {
+        const newRoute: ConversationRoute = { kind: "new" };
+        writeHistoryRoute(newRoute, [], "replace");
+        if (parsed.invalid)
+          setNotice({
+            tone: "error",
+            text: "That conversation link is not valid.",
+          });
+        newConversationRef.current("none");
+        return;
+      }
+      const state = readHistoryState(
+        window.history.state,
+        routeHash(parsed.route),
+      );
+      if (parsed.route.kind === "new") {
+        newConversationRef.current("none");
+        return;
+      }
+      navigateToThread(
+        parsed.route.threadId,
+        state?.threadTrail ?? [],
+        "none",
+        state?.parentRoute,
+      );
+    };
+    window.addEventListener("popstate", handleLocationChange);
+    window.addEventListener("hashchange", handleLocationChange);
+    return () => {
+      window.removeEventListener("popstate", handleLocationChange);
+      window.removeEventListener("hashchange", handleLocationChange);
+    };
+  }, [navigateToThread]);
 
   useEffect(() => {
     const onShortcut = (event: KeyboardEvent) => {
@@ -1146,6 +1479,7 @@ export default function App() {
     setSending(true);
     setNotice(null);
     const selectionAtSend = selectedRef.current;
+    const loadVersionAtSend = loadVersionRef.current;
     let threadId = selectedThread?.id;
     try {
       const input: UserInput[] = [];
@@ -1203,31 +1537,43 @@ export default function App() {
           model: string;
           cwd: string;
         }>("thread/start", startParams);
-        threadId = started.thread.id;
-        turnParams.threadId = threadId;
-        if (selectedRef.current === selectionAtSend) {
-          selectedRef.current = threadId;
-          setSelectedThread(started.thread);
-          setThreadDetails({
-            ...started,
-            approvalPolicy: approvalPolicy || null,
-            sandbox: sandboxMode
-              ? {
-                  type: sandboxMode.replace(/-([a-z])/g, (_, char: string) =>
-                    char.toUpperCase(),
-                  ),
-                }
-              : null,
-            activePermissionProfile: null,
-            reasoningEffort: effort || null,
-            thread: { status: { type: "idle" } },
-          });
-          sessionStorage.setItem(selectedThreadKey, threadId);
-        }
         setThreads((current) => [
           started.thread,
-          ...current.filter((entry) => entry.id !== threadId),
+          ...current.filter((entry) => entry.id !== started.thread.id),
         ]);
+        if (
+          loadVersionRef.current !== loadVersionAtSend ||
+          selectedRef.current !== selectionAtSend ||
+          routeRef.current.kind !== "new"
+        )
+          return;
+        threadId = started.thread.id;
+        turnParams.threadId = threadId;
+        const startedRoute: ConversationRoute = {
+          kind: "thread",
+          threadId,
+        };
+        routeRef.current = startedRoute;
+        setRoute(startedRoute);
+        writeHistoryRoute(startedRoute, [], "push");
+        historyHandledRef.current = `${window.location.href}|${JSON.stringify(window.history.state)}`;
+        selectedRef.current = threadId;
+        setSelectedThread(started.thread);
+        setThreadDetails({
+          ...started,
+          approvalPolicy: approvalPolicy || null,
+          sandbox: sandboxMode
+            ? {
+                type: sandboxMode.replace(/-([a-z])/g, (_, char: string) =>
+                  char.toUpperCase(),
+                ),
+              }
+            : null,
+          activePermissionProfile: null,
+          reasoningEffort: effort || null,
+          thread: { status: { type: "idle" } },
+        });
+        sessionStorage.setItem(selectedThreadKey, threadId);
       }
 
       const actualRequestBytes = serializedRequestBytes(
@@ -1496,7 +1842,7 @@ export default function App() {
           </button>
         </div>
 
-        <button className="new-chat-button" onClick={newConversation}>
+        <button className="new-chat-button" onClick={() => newConversation()}>
           <Plus size={16} strokeWidth={2.2} />
           <span>New conversation</span>
           <kbd>⌘ K</kbd>
