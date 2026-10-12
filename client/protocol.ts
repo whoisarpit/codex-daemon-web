@@ -187,7 +187,7 @@ export class RpcClient {
           : "The local daemon bridge reported an error.";
       this.options.onState("reconnecting", detail);
       this.bridgeError = detail;
-      this.socket?.close(1011, "Local bridge error");
+      this.socket?.close(4001, "Local bridge error");
       return;
     }
     if (typeof message.method === "string") {

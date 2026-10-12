@@ -48,6 +48,7 @@ import type {
 import "./styles.css";
 
 type TimelineItem = ThreadItemEntry & { streaming?: boolean };
+type ThreadTrailEntry = { id: string; title: string };
 type PendingUpload = {
   id: string;
   name: string;
@@ -284,6 +285,7 @@ export default function App() {
   const [selectedThread, setSelectedThread] = useState<ThreadSummary | null>(
     null,
   );
+  const [threadTrail, setThreadTrail] = useState<ThreadTrailEntry[]>([]);
   const [threadDetails, setThreadDetails] = useState<ThreadDetails | null>(
     null,
   );
@@ -328,6 +330,7 @@ export default function App() {
   const composerRef = useRef<HTMLTextAreaElement>(null);
   const scrollWasNearBottom = useRef(true);
   const loadVersionRef = useRef(0);
+  const threadNavigationRef = useRef(false);
   const sessionExpiredRef = useRef(false);
   const sessionProbeEpochRef = useRef(0);
   const sessionProbeSequenceRef = useRef(0);
@@ -399,6 +402,7 @@ export default function App() {
     setToken("");
     setThreads([]);
     threadsRef.current = [];
+    setThreadTrail([]);
     setSelectedThread(null);
     setThreadDetails(null);
     setItems([]);
@@ -625,18 +629,58 @@ export default function App() {
         liveItemsRef.current.add(itemId);
         setItems((current) =>
           updateItem(current, itemId, (item) => {
-            const key =
-              method === "item/plan/delta"
-                ? "text"
-                : method === "item/reasoning/textDelta"
-                  ? "content"
-                  : method === "item/reasoning/summaryTextDelta"
-                    ? "summary"
-                    : "text";
+            const key = method.startsWith("item/reasoning/")
+              ? method === "item/reasoning/textDelta"
+                ? "content"
+                : "summary"
+              : "text";
             const prior = item[key];
+            if (key !== "text") {
+              const indexKey =
+                key === "summary" ? "summaryIndex" : "contentIndex";
+              const requestedIndex = params[indexKey];
+              const partIndex =
+                typeof requestedIndex === "number" &&
+                Number.isInteger(requestedIndex) &&
+                requestedIndex >= 0
+                  ? requestedIndex
+                  : 0;
+              const parts = Array.isArray(prior)
+                ? prior.map((part) => asString(part))
+                : prior
+                  ? [asString(prior)]
+                  : [];
+              while (parts.length <= partIndex) parts.push("");
+              parts[partIndex] += delta;
+              return { ...item, [key]: parts };
+            }
             if (Array.isArray(prior))
               return { ...item, [key]: [...prior, delta] };
             return { ...item, [key]: `${asString(prior)}${delta}` };
+          }),
+        );
+        return;
+      }
+      if (method === "item/reasoning/summaryPartAdded") {
+        const itemId = asString(params.itemId);
+        const requestedIndex = params.summaryIndex;
+        if (!itemId) return;
+        const partIndex =
+          typeof requestedIndex === "number" &&
+          Number.isInteger(requestedIndex) &&
+          requestedIndex >= 0
+            ? requestedIndex
+            : 0;
+        liveItemsRef.current.add(itemId);
+        setItems((current) =>
+          updateItem(current, itemId, (item) => {
+            const parts = Array.isArray(item.summary)
+              ? item.summary.map((part) => asString(part))
+              : item.summary
+                ? [asString(item.summary)]
+                : [];
+            while (parts.length <= partIndex) parts.push("");
+            return { ...item, summary: parts };
           }),
         );
         return;
@@ -705,6 +749,7 @@ export default function App() {
               name?: string | null;
               preview?: string;
               cwd?: string;
+              canAcceptDirectInput?: boolean | null;
             };
           }
         >("thread/resume", {
@@ -722,6 +767,8 @@ export default function App() {
           isRecord(response.thread.status) &&
             response.thread.status.type === "active",
         );
+        if (response.thread.canAcceptDirectInput === false)
+          setShowSettings(false);
         setSelectedThread((current) => {
           if (
             version !== loadVersionRef.current ||
@@ -753,6 +800,10 @@ export default function App() {
             reasoningEffort:
               response.reasoningEffort ?? existing?.reasoningEffort ?? null,
             status: response.thread.status,
+            canAcceptDirectInput:
+              response.thread.canAcceptDirectInput ??
+              existing?.canAcceptDirectInput ??
+              null,
             name: response.thread.name ?? existing?.name ?? null,
             preview: response.thread.preview ?? existing?.preview ?? "",
           };
@@ -807,6 +858,51 @@ export default function App() {
     },
     [],
   );
+
+  const openAgentThread = useCallback(
+    (threadId: string, parentThreadId?: string) => {
+      const parentId = parentThreadId || selectedThread?.id;
+      if (
+        !client ||
+        !selectedThread ||
+        !parentId ||
+        !threadId ||
+        threadId === selectedThread.id ||
+        loadingThread ||
+        threadNavigationRef.current
+      )
+        return;
+      threadNavigationRef.current = true;
+      const parentSummary =
+        selectedThread.id === parentId
+          ? selectedThread
+          : threadsRef.current.find((thread) => thread.id === parentId);
+      setThreadTrail((current) => [
+        ...current,
+        {
+          id: parentId,
+          title: parentSummary
+            ? titleFor(parentSummary)
+            : "Parent conversation",
+        },
+      ]);
+      void openThread(client, threadId, true).finally(() => {
+        threadNavigationRef.current = false;
+      });
+    },
+    [client, loadingThread, openThread, selectedThread],
+  );
+
+  const returnToParentThread = useCallback(() => {
+    const parent = threadTrail.at(-1);
+    if (!client || !parent || loadingThread || threadNavigationRef.current)
+      return;
+    threadNavigationRef.current = true;
+    setThreadTrail((current) => current.slice(0, -1));
+    void openThread(client, parent.id, true).finally(() => {
+      threadNavigationRef.current = false;
+    });
+  }, [client, loadingThread, openThread, threadTrail]);
 
   const onReady = useCallback(
     (rpc: RpcClient) => {
@@ -897,6 +993,7 @@ export default function App() {
     } finally {
       detach();
       selectedRef.current = null;
+      setThreadTrail([]);
       setStatus({ authenticated: false, daemon: { available: false } });
       setThreads([]);
       setSelectedThread(null);
@@ -908,11 +1005,15 @@ export default function App() {
 
   const chooseThread = (thread: ThreadSummary) => {
     if (!client) return;
+    threadNavigationRef.current = false;
+    setThreadTrail([]);
     void openThread(client, thread.id, true);
   };
 
   const newConversation = () => {
     ++loadVersionRef.current;
+    threadNavigationRef.current = false;
+    setThreadTrail([]);
     selectedRef.current = null;
     sessionStorage.removeItem(selectedThreadKey);
     setSelectedThread(null);
@@ -1020,6 +1121,13 @@ export default function App() {
 
   const sendMessage = async (event?: FormEvent<HTMLFormElement>) => {
     event?.preventDefault();
+    if (selectedThread?.canAcceptDirectInput === false) {
+      setNotice({
+        tone: "info",
+        text: "This agent is controlled by its parent.",
+      });
+      return;
+    }
     if (
       sending ||
       compressingUploadsRef.current ||
@@ -1156,7 +1264,14 @@ export default function App() {
   };
 
   const interruptTurn = async () => {
-    if (!client || !selectedThread || !activeTurnId || interrupting) return;
+    if (
+      !client ||
+      !selectedThread ||
+      selectedThread.canAcceptDirectInput === false ||
+      !activeTurnId ||
+      interrupting
+    )
+      return;
     setInterrupting(true);
     try {
       await client.request("turn/interrupt", {
@@ -1336,6 +1451,7 @@ export default function App() {
   const canSubmit =
     connection === "online" &&
     !sending &&
+    selectedThread?.canAcceptDirectInput !== false &&
     !loadingThread &&
     !compressingUploads &&
     selectedRef.current === (selectedThread?.id ?? null) &&
@@ -1555,6 +1671,17 @@ export default function App() {
             <Menu size={19} />
           </button>
           <div className="topbar-title">
+            {threadTrail.length ? (
+              <button
+                type="button"
+                className="thread-parent-link"
+                disabled={loadingThread}
+                onClick={returnToParentThread}
+              >
+                <ChevronRight size={13} />
+                <span>Back to {threadTrail.at(-1)?.title}</span>
+              </button>
+            ) : null}
             <span className="desktop-title">{selectedTitle}</span>
             <ChevronDown size={14} />
           </div>
@@ -1713,6 +1840,7 @@ export default function App() {
             <TimelineCard
               key={`${entry.turnId}-${entry.item.id}`}
               entry={entry}
+              onOpenThread={openAgentThread}
             />
           ))}
           {turnActive && !items.some((entry) => entry.streaming) ? (
@@ -1727,6 +1855,11 @@ export default function App() {
 
         <div className="composer-wrap">
           <form className="composer-card" onSubmit={sendMessage}>
+            {selectedThread?.canAcceptDirectInput === false ? (
+              <div className="agent-read-only" role="status">
+                This agent is controlled by its parent.
+              </div>
+            ) : null}
             {uploads.length ? (
               <div className="upload-strip">
                 {uploads.map((upload) => (
@@ -1736,7 +1869,10 @@ export default function App() {
                     <button
                       type="button"
                       aria-label={`Remove ${upload.name}`}
-                      disabled={compressingUploads}
+                      disabled={
+                        compressingUploads ||
+                        selectedThread?.canAcceptDirectInput === false
+                      }
                       onClick={() =>
                         setUploads((current) =>
                           current.filter((item) => item.id !== upload.id),
@@ -1777,7 +1913,11 @@ export default function App() {
                   : "Waiting for the Codex connection…"
               }
               rows={1}
-              disabled={connection !== "online" || sending}
+              disabled={
+                connection !== "online" ||
+                sending ||
+                selectedThread?.canAcceptDirectInput === false
+              }
             />
             <div className="composer-toolbar">
               <div className="composer-tools">
@@ -1791,7 +1931,11 @@ export default function App() {
                     type="file"
                     accept="image/*"
                     multiple
-                    disabled={compressingUploads || sending}
+                    disabled={
+                      compressingUploads ||
+                      sending ||
+                      selectedThread?.canAcceptDirectInput === false
+                    }
                     onChange={(event) => {
                       void addImages(event.currentTarget.files);
                       event.currentTarget.value = "";
@@ -1803,6 +1947,7 @@ export default function App() {
                   className={`composer-tool ${showSettings ? "active" : ""}`}
                   title="Model and permission options"
                   aria-expanded={showSettings}
+                  disabled={selectedThread?.canAcceptDirectInput === false}
                   onClick={() => setShowSettings((value) => !value)}
                 >
                   <Shield size={16} />
@@ -1819,7 +1964,10 @@ export default function App() {
                     type="button"
                     className="send-button stop-button"
                     onClick={() => void interruptTurn()}
-                    disabled={interrupting}
+                    disabled={
+                      interrupting ||
+                      selectedThread?.canAcceptDirectInput === false
+                    }
                     aria-label="Interrupt turn"
                   >
                     {interrupting ? (
@@ -2100,7 +2248,13 @@ function UnavailableScreen({
   );
 }
 
-function TimelineCard({ entry }: { entry: TimelineItem }) {
+function TimelineCard({
+  entry,
+  onOpenThread,
+}: {
+  entry: TimelineItem;
+  onOpenThread: (threadId: string, parentThreadId?: string) => void;
+}) {
   const item = entry.item;
   if (item.type === "userMessage") {
     const content = Array.isArray(item.content)
@@ -2118,6 +2272,7 @@ function TimelineCard({ entry }: { entry: TimelineItem }) {
   }
   if (item.type === "agentMessage") {
     const text = asString(item.text);
+    if (!text.trim() && item.delivery !== "failed") return null;
     return (
       <article className="message-row assistant-row">
         <div className="assistant-mark">
@@ -2143,6 +2298,36 @@ function TimelineCard({ entry }: { entry: TimelineItem }) {
     );
   }
   if (item.type === "commandExecution") {
+    const command = asString(item.command);
+    const output = asString(item.aggregatedOutput);
+    const status = activityStatus(
+      item.status ?? (entry.streaming ? "inProgress" : undefined),
+    );
+    if (!command.trim() && !output.trim()) {
+      if (entry.streaming)
+        return (
+          <div className="activity-card activity-progress">
+            <span className="activity-icon command">
+              <Terminal size={14} />
+            </span>
+            <span className="activity-title">Running command</span>
+            <span className="activity-status running">Running</span>
+          </div>
+        );
+      if (["failed", "interrupted"].includes(status.className))
+        return (
+          <div className="activity-card activity-progress">
+            <span className="activity-icon command">
+              <Terminal size={14} />
+            </span>
+            <span className="activity-title">Command</span>
+            <span className={`activity-status ${status.className}`}>
+              {status.label}
+            </span>
+          </div>
+        );
+      return null;
+    }
     return (
       <details className="activity-card">
         <summary>
@@ -2150,10 +2335,8 @@ function TimelineCard({ entry }: { entry: TimelineItem }) {
             <Terminal size={14} />
           </span>
           <span className="activity-title">Ran command</span>
-          <span
-            className={`activity-status ${(item.status as string) === "completed" ? "complete" : "running"}`}
-          >
-            {capitalize(asString(item.status, "running"))}
+          <span className={`activity-status ${status.className}`}>
+            {status.label}
           </span>
           <ChevronDown className="activity-chevron" size={15} />
         </summary>
@@ -2186,6 +2369,32 @@ function TimelineCard({ entry }: { entry: TimelineItem }) {
     const changes = Array.isArray(item.changes)
       ? (item.changes as Array<Record<string, unknown>>)
       : [];
+    const status = activityStatus(item.status);
+    if (!changes.length) {
+      if (entry.streaming)
+        return (
+          <div className="activity-card activity-progress">
+            <span className="activity-icon file">
+              <FilePlus2 size={14} />
+            </span>
+            <span className="activity-title">Preparing file changes</span>
+            <span className="activity-status running">Running</span>
+          </div>
+        );
+      if (["failed", "interrupted"].includes(status.className))
+        return (
+          <div className="activity-card activity-progress">
+            <span className="activity-icon file">
+              <FilePlus2 size={14} />
+            </span>
+            <span className="activity-title">File changes</span>
+            <span className={`activity-status ${status.className}`}>
+              {status.label}
+            </span>
+          </div>
+        );
+      return null;
+    }
     return (
       <details className="activity-card">
         <summary>
@@ -2221,28 +2430,42 @@ function TimelineCard({ entry }: { entry: TimelineItem }) {
     );
   }
   if (item.type === "reasoning") {
-    const summary = Array.isArray(item.summary) ? item.summary.join("\n") : "";
-    const reasoning = Array.isArray(item.content)
-      ? item.content.join("\n")
-      : "";
+    const summary = (
+      Array.isArray(item.summary)
+        ? item.summary
+        : typeof item.summary === "string"
+          ? [item.summary]
+          : []
+    )
+      .map((part) => asString(part).trim())
+      .filter(Boolean)
+      .join("\n");
+    if (!summary) return null;
     return (
       <details className="reasoning-card">
         <summary>
           <span className="reasoning-spark">✳</span>
-          <span>Reasoning</span>
+          <span>Reasoning summary</span>
           <ChevronDown className="activity-chevron" size={14} />
         </summary>
         <div className="reasoning-body">
-          <MarkdownContent
-            text={
-              summary || reasoning || "Reasoning details are not available."
-            }
-          />
+          <MarkdownContent text={summary} />
         </div>
       </details>
     );
   }
-  if (item.type === "plan")
+  if (item.type === "plan") {
+    const text = asString(item.text);
+    if (!text.trim())
+      return entry.streaming ? (
+        <div className="activity-card activity-progress">
+          <span className="activity-icon plan">
+            <FileText size={14} />
+          </span>
+          <span className="activity-title">Preparing plan</span>
+          <span className="activity-status running">Running</span>
+        </div>
+      ) : null;
     return (
       <details className="activity-card plan-card">
         <summary>
@@ -2257,13 +2480,20 @@ function TimelineCard({ entry }: { entry: TimelineItem }) {
         </div>
       </details>
     );
+  }
+  if (item.type === "collabAgentToolCall")
+    return <CollabAgentActivity item={item} onOpenThread={onOpenThread} />;
+  if (item.type === "subAgentActivity")
+    return <SubAgentActivity item={item} onOpenThread={onOpenThread} />;
   if (
     item.type === "mcpToolCall" ||
     item.type === "dynamicToolCall" ||
     item.type === "functionCallOutput"
   )
-    return <ToolActivity item={item} />;
-  if (item.type === "webSearch")
+    return <ToolActivity item={item} streaming={entry.streaming} />;
+  if (item.type === "webSearch") {
+    if (!hasMeaningfulActivityDetails(item))
+      return entry.streaming ? <ToolActivity item={item} streaming /> : null;
     return (
       <details className="activity-card">
         <summary>
@@ -2275,11 +2505,12 @@ function TimelineCard({ entry }: { entry: TimelineItem }) {
         </summary>
         <div className="activity-body">
           <pre>
-            <code>{formatUnknown(item)}</code>
+            <code>{formatActivityDetails(item)}</code>
           </pre>
         </div>
       </details>
     );
+  }
   if (item.type === "contextCompaction")
     return <div className="system-item">Context summarized</div>;
   if (
@@ -2287,15 +2518,17 @@ function TimelineCard({ entry }: { entry: TimelineItem }) {
       "sleep",
       "enteredReviewMode",
       "exitedReviewMode",
-      "subAgentActivity",
-      "collabAgentToolCall",
       "imageView",
       "imageGeneration",
       "hookPrompt",
     ].includes(item.type)
   )
     return <ToolActivity item={item} />;
-  return <ToolActivity item={item} />;
+  return hasMeaningfulActivityDetails(item) ? (
+    <ToolActivity item={item} streaming={entry.streaming} />
+  ) : entry.streaming ? (
+    <ToolActivity item={item} streaming />
+  ) : null;
 }
 
 function UserInputPart({ part }: { part: Record<string, unknown> }) {
@@ -2326,50 +2559,223 @@ function UserInputPart({ part }: { part: Record<string, unknown> }) {
   return null;
 }
 
-function ToolActivity({ item }: { item: ThreadItem }) {
+function ToolActivity({
+  item,
+  streaming = false,
+}: {
+  item: ThreadItem;
+  streaming?: boolean;
+}) {
   const type = item.type;
   const title =
     type === "mcpToolCall"
-      ? `${asString(item.server)} · ${asString(item.tool)}`
+      ? [asString(item.server), asString(item.tool)]
+          .filter(Boolean)
+          .join(" · ") || "MCP tool"
       : type === "dynamicToolCall"
-        ? `${asString(item.namespace) ? `${asString(item.namespace)}/` : ""}${asString(item.tool)}`
+        ? `${asString(item.namespace) ? `${asString(item.namespace)}/` : ""}${asString(item.tool)}` ||
+          "Dynamic tool"
         : type === "functionCallOutput"
           ? asString(item.name, "Tool output")
-          : type === "collabAgentToolCall"
-            ? asString(item.tool, "Agent handoff")
-            : type === "subAgentActivity"
-              ? "Sub-agent activity"
-              : type === "hookPrompt"
-                ? "Instruction hook"
-                : type === "imageGeneration"
-                  ? "Image generation"
-                  : type === "imageView"
-                    ? "Viewed image"
-                    : type === "enteredReviewMode"
-                      ? "Review started"
-                      : type === "exitedReviewMode"
-                        ? "Review complete"
-                        : type === "sleep"
-                          ? "Wait"
-                          : "Tool activity";
+          : type === "hookPrompt"
+            ? "Instruction hook"
+            : type === "imageGeneration"
+              ? "Image generation"
+              : type === "imageView"
+                ? "Viewed image"
+                : type === "enteredReviewMode"
+                  ? "Review started"
+                  : type === "exitedReviewMode"
+                    ? "Review complete"
+                    : type === "sleep"
+                      ? "Wait"
+                      : humanizeItemType(type);
+  const status = activityStatus(
+    item.status ?? (streaming ? "inProgress" : undefined),
+    item.success,
+  );
+  const details = hasMeaningfulActivityDetails(item);
+  const summary = (
+    <>
+      <span className="activity-icon tool">
+        <Command size={14} />
+      </span>
+      <span className="activity-title">{title}</span>
+      <span className={`activity-status ${status.className}`}>
+        {status.label}
+      </span>
+    </>
+  );
+  if (!details)
+    return <div className="activity-card activity-progress">{summary}</div>;
   return (
     <details className="activity-card">
       <summary>
-        <span className="activity-icon tool">
-          <Command size={14} />
-        </span>
-        <span className="activity-title">{title}</span>
-        <span className="activity-status">
-          {capitalize(asString(item.status, "details"))}
-        </span>
+        {summary}
         <ChevronDown className="activity-chevron" size={15} />
       </summary>
       <div className="activity-body">
         <pre>
-          <code>{formatUnknown(item)}</code>
+          <code>{formatActivityDetails(item)}</code>
         </pre>
       </div>
     </details>
+  );
+}
+
+function CollabAgentActivity({
+  item,
+  onOpenThread,
+}: {
+  item: ThreadItem;
+  onOpenThread: (threadId: string, parentThreadId?: string) => void;
+}) {
+  const tool = asString(item.tool);
+  const toolLabels: Record<string, string> = {
+    spawnAgent: "Started agent",
+    sendInput: "Sent task to agent",
+    resumeAgent: "Resumed agent",
+    wait: "Waiting for agent",
+    closeAgent: "Closed agent",
+    sendMessage: "Messaged agent",
+    followupTask: "Added agent task",
+    interruptAgent: "Interrupted agent",
+    listAgents: "Checked agents",
+  };
+  const title = toolLabels[tool] ?? "Agent activity";
+  const status = activityStatus(item.status);
+  const prompt = asString(item.prompt).trim();
+  const promptPreview = prompt.replace(/\s+/g, " ");
+  const receiverIds = Array.isArray(item.receiverThreadIds)
+    ? item.receiverThreadIds.filter(
+        (threadId): threadId is string => typeof threadId === "string",
+      )
+    : [];
+  const agentsStates = isRecord(item.agentsStates) ? item.agentsStates : {};
+  const hasDetails = Boolean(
+    prompt || receiverIds.length || item.model || item.reasoningEffort,
+  );
+  const summary = (
+    <>
+      <span className="activity-icon tool">
+        <Command size={14} />
+      </span>
+      <span className="activity-title">{title}</span>
+      {promptPreview ? (
+        <span className="activity-context">{promptPreview}</span>
+      ) : null}
+      <span className={`activity-status ${status.className}`}>
+        {status.label}
+      </span>
+    </>
+  );
+
+  if (!hasDetails)
+    return (
+      <div className="activity-card activity-progress agent-activity">
+        {summary}
+      </div>
+    );
+
+  return (
+    <details className="activity-card agent-activity">
+      <summary>
+        {summary}
+        <ChevronDown className="activity-chevron" size={15} />
+      </summary>
+      {hasDetails ? (
+        <div className="activity-body agent-activity-body">
+          {prompt ? <p className="agent-prompt">{prompt}</p> : null}
+          {item.model || item.reasoningEffort ? (
+            <p className="agent-model">
+              {[asString(item.model), asString(item.reasoningEffort)]
+                .filter(Boolean)
+                .join(" · ")}
+            </p>
+          ) : null}
+          {receiverIds.map((threadId) => {
+            const state = isRecord(agentsStates[threadId])
+              ? agentsStates[threadId]
+              : {};
+            const agentStatus = activityStatus(
+              state.status,
+              undefined,
+              "Linked",
+            );
+            return (
+              <div className="agent-thread-entry" key={threadId}>
+                <button
+                  type="button"
+                  className="agent-thread-button"
+                  onClick={() =>
+                    onOpenThread(threadId, asString(item.senderThreadId))
+                  }
+                >
+                  <span>Agent {threadId.slice(0, 8)}</span>
+                  <span className={`activity-status ${agentStatus.className}`}>
+                    {agentStatus.label}
+                  </span>
+                  <ChevronRight size={14} />
+                </button>
+                {asString(state.message) ? (
+                  <small className="agent-thread-message">
+                    {asString(state.message)}
+                  </small>
+                ) : null}
+              </div>
+            );
+          })}
+        </div>
+      ) : null}
+    </details>
+  );
+}
+
+function SubAgentActivity({
+  item,
+  onOpenThread,
+}: {
+  item: ThreadItem;
+  onOpenThread: (threadId: string, parentThreadId?: string) => void;
+}) {
+  const kind = asString(item.kind);
+  const kindLabels: Record<string, string> = {
+    started: "Started",
+    interacted: "Updated",
+    interrupted: "Interrupted",
+    completed: "Completed",
+  };
+  const path = asString(item.agentPath);
+  const pathLabel = path.split("/").filter(Boolean).at(-1) || "Agent";
+  const threadId = asString(item.agentThreadId);
+  const status = activityStatus(kind);
+
+  return (
+    <div className="activity-card activity-progress subagent-activity">
+      <span className="activity-icon tool">
+        <Command size={14} />
+      </span>
+      <span className="activity-title">
+        {pathLabel} · {kindLabels[kind] ?? "Activity"}
+      </span>
+      {item.model ? (
+        <span className="activity-context">{asString(item.model)}</span>
+      ) : null}
+      <span className={`activity-status ${status.className}`}>
+        {status.label}
+      </span>
+      {threadId ? (
+        <button
+          type="button"
+          className="agent-open-button"
+          aria-label={`Open ${pathLabel} conversation`}
+          title="Open agent conversation"
+          onClick={() => onOpenThread(threadId)}
+        >
+          <ChevronRight size={14} />
+        </button>
+      ) : null}
+    </div>
   );
 }
 
@@ -2846,6 +3252,68 @@ function formatUnknown(value: unknown): string {
   } catch {
     return String(value);
   }
+}
+
+function hasActivityValue(value: unknown): boolean {
+  if (typeof value === "string") return Boolean(value.trim());
+  if (typeof value === "number" || typeof value === "boolean") return true;
+  if (Array.isArray(value)) return value.some(hasActivityValue);
+  if (isRecord(value))
+    return Object.entries(value).some(
+      ([key, entry]) =>
+        key !== "id" && key !== "type" && hasActivityValue(entry),
+    );
+  return false;
+}
+
+function hasMeaningfulActivityDetails(item: ThreadItem): boolean {
+  const metadata = new Set(["id", "type", "status", "durationMs", "success"]);
+  return Object.entries(item).some(
+    ([key, value]) => !metadata.has(key) && hasActivityValue(value),
+  );
+}
+
+function formatActivityDetails(item: ThreadItem): string {
+  return formatUnknown(
+    Object.fromEntries(
+      Object.entries(item).filter(([key]) => key !== "id" && key !== "type"),
+    ),
+  );
+}
+
+function humanizeItemType(type: string): string {
+  return capitalize(
+    type.replace(/([a-z])([A-Z])/g, "$1 $2").replace(/[_-]/g, " "),
+  );
+}
+
+function activityStatus(
+  value: unknown,
+  success?: unknown,
+  fallback = "Details",
+): { label: string; className: string } {
+  const raw = asString(value);
+  const labels: Record<string, { label: string; className: string }> = {
+    inProgress: { label: "Running", className: "running" },
+    running: { label: "Running", className: "running" },
+    pendingInit: { label: "Starting", className: "running" },
+    started: { label: "Running", className: "running" },
+    interacted: { label: "Active", className: "running" },
+    completed: { label: "Complete", className: "complete" },
+    complete: { label: "Complete", className: "complete" },
+    interrupted: { label: "Interrupted", className: "interrupted" },
+    failed: { label: "Failed", className: "failed" },
+    declined: { label: "Declined", className: "failed" },
+    errored: { label: "Failed", className: "failed" },
+    shutdown: { label: "Stopped", className: "interrupted" },
+    notFound: { label: "Unavailable", className: "failed" },
+  };
+  if (labels[raw]) return labels[raw];
+  if (success === false) return labels.failed;
+  if (success === true) return labels.completed;
+  return raw
+    ? { label: humanizeItemType(raw), className: "" }
+    : { label: fallback, className: "" };
 }
 
 function capitalize(value: string): string {
