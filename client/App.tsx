@@ -1,0 +1,2865 @@
+import {
+  Archive,
+  ArrowUp,
+  Check,
+  ChevronDown,
+  ChevronRight,
+  CircleHelp,
+  Code2,
+  Command,
+  FilePlus2,
+  FileText,
+  ImagePlus,
+  LoaderCircle,
+  Menu,
+  MessageSquareText,
+  MoreHorizontal,
+  PanelLeftClose,
+  PanelLeftOpen,
+  Pencil,
+  Plus,
+  Shield,
+  Square,
+  Terminal,
+  X,
+} from "lucide-react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type FormEvent,
+} from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
+import { RpcClient, type ConnectionState } from "./protocol";
+import type {
+  ApprovalPrompt,
+  DaemonStatus,
+  ModelOption,
+  RpcError,
+  ThreadDetails,
+  ThreadItem,
+  ThreadItemEntry,
+  ThreadSummary,
+  UserInput,
+} from "./types";
+import "./styles.css";
+
+type TimelineItem = ThreadItemEntry & { streaming?: boolean };
+type PendingUpload = {
+  id: string;
+  name: string;
+  dataUrl: string;
+  size: number;
+};
+type AppNotice = { tone: "info" | "error" | "success"; text: string };
+
+const selectedThreadKey = "codex-desk.selected-thread";
+const maxTurnRequestBytes = 900 * 1024;
+const maxAttachmentBytes = 700 * 1024;
+const maxCompressedImageBytes = 320 * 1024;
+const maxImageFileBytes = 20 * 1024 * 1024;
+const maxImageCount = 4;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function asString(value: unknown, fallback = ""): string {
+  return typeof value === "string" ? value : fallback;
+}
+
+function shortError(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  return "Something went wrong. Please try again.";
+}
+
+function blobToDataUrl(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () =>
+      typeof reader.result === "string"
+        ? resolve(reader.result)
+        : reject(new Error("Could not read the compressed image."));
+    reader.onerror = () =>
+      reject(new Error("Could not read the compressed image."));
+    reader.readAsDataURL(blob);
+  });
+}
+
+function canvasToJpeg(
+  canvas: HTMLCanvasElement,
+  quality: number,
+): Promise<Blob> {
+  return new Promise((resolve, reject) => {
+    canvas.toBlob(
+      (blob) =>
+        blob
+          ? resolve(blob)
+          : reject(new Error("Could not compress this image.")),
+      "image/jpeg",
+      quality,
+    );
+  });
+}
+
+async function compressImage(file: File): Promise<string> {
+  const bitmap = await createImageBitmap(file);
+  try {
+    const maxDimension = 2048;
+    let scale = Math.min(
+      1,
+      maxDimension / Math.max(bitmap.width, bitmap.height),
+    );
+    const canvas = document.createElement("canvas");
+    const context = canvas.getContext("2d");
+    if (!context) throw new Error("Image compression is unavailable.");
+
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      canvas.width = Math.max(1, Math.round(bitmap.width * scale));
+      canvas.height = Math.max(1, Math.round(bitmap.height * scale));
+      context.fillStyle = "#fff";
+      context.fillRect(0, 0, canvas.width, canvas.height);
+      context.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+      const quality = Math.max(0.3, 0.86 - (attempt % 5) * 0.12);
+      const blob = await canvasToJpeg(canvas, quality);
+      const dataUrl = await blobToDataUrl(blob);
+      if (
+        new TextEncoder().encode(dataUrl).byteLength <= maxCompressedImageBytes
+      )
+        return dataUrl;
+      if (attempt % 5 === 4) scale *= 0.78;
+    }
+    throw new Error(
+      `${file.name} could not be compressed under the image limit.`,
+    );
+  } finally {
+    bitmap.close();
+  }
+}
+
+function serializedRequestBytes(
+  method: string,
+  params: Record<string, unknown>,
+) {
+  const request = JSON.stringify({
+    id: Number.MAX_SAFE_INTEGER,
+    method,
+    params,
+  });
+  return new TextEncoder().encode(request).byteLength;
+}
+
+function safeImageUrl(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  if (/^data:image\/(png|jpeg|jpg|gif|webp);base64,/i.test(value)) return value;
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:" ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+function titleFor(thread: ThreadSummary): string {
+  return (
+    thread.name?.trim() ||
+    thread.preview?.trim().split("\n")[0] ||
+    "New conversation"
+  );
+}
+
+function statusLabel(state: ConnectionState): string {
+  if (state === "online") return "Connected";
+  if (state === "offline") return "Offline";
+  if (state === "connecting") return "Connecting";
+  return "Reconnecting";
+}
+
+function describeApproval(value: unknown): string {
+  if (typeof value === "string") {
+    if (value === "on-request") return "On request";
+    if (value === "untrusted") return "Untrusted";
+    if (value === "never") return "Never";
+    return value;
+  }
+  if (isRecord(value) && isRecord(value.granular)) {
+    const policy = value.granular;
+    const enabled = [
+      ["sandbox_approval", "sandbox"],
+      ["rules", "rules"],
+      ["skill_approval", "skills"],
+      ["request_permissions", "permissions"],
+      ["mcp_elicitations", "MCP prompts"],
+    ] as const;
+    const active = enabled
+      .filter(([key]) => policy[key] === true)
+      .map(([, label]) => label);
+    const inactive = enabled
+      .filter(([key]) => policy[key] === false)
+      .map(([, label]) => label);
+    return `Granular · on: ${active.join(", ") || "none"} · off: ${inactive.join(", ") || "none"}`;
+  }
+  return "Daemon default";
+}
+
+function describeSandbox(value: unknown): string {
+  if (!isRecord(value) || typeof value.type !== "string")
+    return "Daemon default";
+  if (value.type === "dangerFullAccess") return "Full access";
+  if (value.type === "readOnly") {
+    return `Read only · network ${value.networkAccess ? "on" : "off"}`;
+  }
+  if (value.type === "workspaceWrite") {
+    const roots = Array.isArray(value.writableRoots)
+      ? value.writableRoots.filter(
+          (root): root is string => typeof root === "string",
+        )
+      : [];
+    return `Workspace write · network ${value.networkAccess ? "on" : "off"} · ${roots.join(", ") || "no writable roots"}`;
+  }
+  if (value.type === "externalSandbox") return "External sandbox";
+  return value.type;
+}
+
+function useRpc() {
+  const clientRef = useRef<RpcClient | null>(null);
+  const [client, setClient] = useState<RpcClient | null>(null);
+  const [connection, setConnection] = useState<ConnectionState>("offline");
+  const [connectionMessage, setConnectionMessage] = useState("");
+
+  const attach = useCallback(
+    (handlers: {
+      onNotification: (method: string, params: Record<string, unknown>) => void;
+      onServerRequest: (request: ApprovalPrompt) => void;
+      onDisconnected: () => void;
+      onReady: (rpc: RpcClient) => void;
+    }) => {
+      clientRef.current?.close();
+      let instance: RpcClient;
+      instance = new RpcClient({
+        onState: (state, message) => {
+          setConnection(state);
+          setConnectionMessage(message ?? "");
+        },
+        onDisconnected: handlers.onDisconnected,
+        onNotification: handlers.onNotification,
+        onServerRequest: handlers.onServerRequest,
+        onReady: () => handlers.onReady(instance),
+      });
+      clientRef.current = instance;
+      setClient(instance);
+      return instance;
+    },
+    [],
+  );
+
+  const detach = useCallback(() => {
+    clientRef.current?.close();
+    clientRef.current = null;
+    setClient(null);
+    setConnection("offline");
+    setConnectionMessage("");
+  }, []);
+
+  useEffect(() => detach, [detach]);
+  return { client, connection, connectionMessage, attach, detach };
+}
+
+export default function App() {
+  const [booting, setBooting] = useState(true);
+  const [status, setStatus] = useState<DaemonStatus | null>(null);
+  const [statusError, setStatusError] = useState("");
+  const [token, setToken] = useState("");
+  const [authBusy, setAuthBusy] = useState(false);
+  const [authError, setAuthError] = useState("");
+  const [notice, setNotice] = useState<AppNotice | null>(null);
+  const [threads, setThreads] = useState<ThreadSummary[]>([]);
+  const threadsRef = useRef<ThreadSummary[]>([]);
+  const [archivedThreads, setArchivedThreads] = useState(false);
+  const [threadCursor, setThreadCursor] = useState<string | null>(null);
+  const [threadSearch, setThreadSearch] = useState("");
+  const [selectedThread, setSelectedThread] = useState<ThreadSummary | null>(
+    null,
+  );
+  const [threadDetails, setThreadDetails] = useState<ThreadDetails | null>(
+    null,
+  );
+  const selectedRef = useRef<string | null>(null);
+  const [items, setItems] = useState<TimelineItem[]>([]);
+  const itemsRef = useRef<TimelineItem[]>([]);
+  const liveItemsRef = useRef(new Set<string>());
+  const [itemCursor, setItemCursor] = useState<string | null>(null);
+  const [loadingOlderItems, setLoadingOlderItems] = useState(false);
+  const [loadingThread, setLoadingThread] = useState(false);
+  const [activeTurnId, setActiveTurnId] = useState<string | null>(null);
+  const [turnActive, setTurnActive] = useState(false);
+  const [models, setModels] = useState<ModelOption[]>([]);
+  const [model, setModel] = useState("");
+  const [effort, setEffort] = useState("");
+  const [cwd, setCwd] = useState("");
+  const [approvalPolicy, setApprovalPolicy] = useState("");
+  const [sandboxMode, setSandboxMode] = useState("");
+  const [showSettings, setShowSettings] = useState(false);
+  const [composer, setComposer] = useState("");
+  const [uploads, setUploads] = useState<PendingUpload[]>([]);
+  const [compressingUploads, setCompressingUploads] = useState(false);
+  const compressingUploadsRef = useRef(false);
+  const [sending, setSending] = useState(false);
+  const [interrupting, setInterrupting] = useState(false);
+  const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [renameId, setRenameId] = useState<string | null>(null);
+  const [renameValue, setRenameValue] = useState("");
+  const [approvalQueue, setApprovalQueue] = useState<ApprovalPrompt[]>([]);
+  const [questionAnswers, setQuestionAnswers] = useState<
+    Record<string, string[]>
+  >({});
+  const { client, connection, connectionMessage, attach, detach } = useRpc();
+  const handlersRef = useRef({
+    onNotification: (_method: string, _params: Record<string, unknown>) => {},
+    onServerRequest: (_request: ApprovalPrompt) => {},
+    onDisconnected: () => {},
+    onReady: (_rpc: RpcClient) => {},
+  });
+  const timelineRef = useRef<HTMLDivElement>(null);
+  const composerRef = useRef<HTMLTextAreaElement>(null);
+  const scrollWasNearBottom = useRef(true);
+  const loadVersionRef = useRef(0);
+  const sessionExpiredRef = useRef(false);
+  const sessionProbeEpochRef = useRef(0);
+  const sessionProbeSequenceRef = useRef(0);
+  const sessionProbeInFlightRef = useRef<number | null>(null);
+  const sessionProbeLastAtRef = useRef(0);
+  const approvalPrompt = approvalQueue[0] ?? null;
+  const newConversationRef = useRef<() => void>(() => {});
+
+  useEffect(() => {
+    if (connection !== "online") {
+      setApprovalQueue([]);
+      setQuestionAnswers({});
+    }
+  }, [connection]);
+  const unknownRequest = Boolean(
+    approvalPrompt &&
+    ![
+      "item/commandExecution/requestApproval",
+      "item/fileChange/requestApproval",
+      "item/permissions/requestApproval",
+      "item/tool/requestUserInput",
+      "item/tool/call",
+    ].includes(approvalPrompt.method),
+  );
+
+  useEffect(() => {
+    threadsRef.current = threads;
+  }, [threads]);
+
+  useEffect(() => {
+    itemsRef.current = items;
+  }, [items]);
+
+  const refreshStatus = useCallback(async () => {
+    setStatusError("");
+    try {
+      const response = await fetch("/api/status", {
+        credentials: "same-origin",
+      });
+      if (response.status === 401) {
+        setStatus({ authenticated: false, daemon: { available: false } });
+        return;
+      }
+      if (!response.ok)
+        throw new Error(`Status request failed (${response.status}).`);
+      const result = (await response.json()) as DaemonStatus;
+      setStatus(result);
+    } catch (error) {
+      setStatusError(shortError(error));
+    } finally {
+      setBooting(false);
+    }
+  }, []);
+
+  const handleSessionExpired = useCallback(() => {
+    if (sessionExpiredRef.current) return;
+    sessionExpiredRef.current = true;
+    ++sessionProbeEpochRef.current;
+    sessionProbeInFlightRef.current = null;
+    ++loadVersionRef.current;
+    detach();
+    selectedRef.current = null;
+    sessionStorage.removeItem(selectedThreadKey);
+    setStatus({ authenticated: false, daemon: { available: false } });
+    setStatusError("");
+    setAuthError(
+      "Your session expired. Sign in again. Your unsent draft is still here.",
+    );
+    setToken("");
+    setThreads([]);
+    threadsRef.current = [];
+    setSelectedThread(null);
+    setThreadDetails(null);
+    setItems([]);
+    itemsRef.current = [];
+    liveItemsRef.current.clear();
+    setItemCursor(null);
+    setLoadingThread(false);
+    setActiveTurnId(null);
+    setTurnActive(false);
+    setModels([]);
+    setModel("");
+    setEffort("");
+    setCwd("");
+    setApprovalPolicy("");
+    setSandboxMode("");
+    setApprovalQueue([]);
+    setQuestionAnswers({});
+    setSending(false);
+    setInterrupting(false);
+    setShowSettings(false);
+  }, [detach]);
+
+  const checkSessionAfterDisconnect = useCallback(() => {
+    if (
+      sessionExpiredRef.current ||
+      sessionProbeInFlightRef.current !== null ||
+      Date.now() - sessionProbeLastAtRef.current < 2500
+    )
+      return;
+
+    const probeId = ++sessionProbeSequenceRef.current;
+    const epoch = sessionProbeEpochRef.current;
+    sessionProbeInFlightRef.current = probeId;
+    sessionProbeLastAtRef.current = Date.now();
+    void fetch("/api/status", { credentials: "same-origin" })
+      .then(async (response) => {
+        if (epoch !== sessionProbeEpochRef.current) return;
+        if (response.status === 401) {
+          handleSessionExpired();
+          return;
+        }
+        if (response.ok) {
+          const result = (await response.json()) as DaemonStatus;
+          if (!result.authenticated) handleSessionExpired();
+        }
+      })
+      .catch(() => {})
+      .finally(() => {
+        if (sessionProbeInFlightRef.current === probeId)
+          sessionProbeInFlightRef.current = null;
+      });
+  }, [handleSessionExpired]);
+
+  useEffect(() => {
+    void refreshStatus();
+  }, [refreshStatus]);
+
+  const refreshThreads = useCallback(
+    async (rpc: RpcClient, archived = archivedThreads, append = false) => {
+      try {
+        const result = await rpc.request<{
+          data: ThreadSummary[];
+          nextCursor: string | null;
+        }>("thread/list", {
+          limit: 40,
+          sortKey: "updated_at",
+          sortDirection: "desc",
+          archived,
+          ...(append && threadCursor ? { cursor: threadCursor } : {}),
+        });
+        setThreads((current) => {
+          const combined = append ? [...current, ...result.data] : result.data;
+          const unique = new Map(combined.map((thread) => [thread.id, thread]));
+          return Array.from(unique.values());
+        });
+        setThreadCursor(result.nextCursor);
+      } catch (error) {
+        setNotice({
+          tone: "error",
+          text: `Could not load conversations: ${shortError(error)}`,
+        });
+      }
+    },
+    [archivedThreads, threadCursor],
+  );
+
+  const loadModels = useCallback(
+    async (rpc: RpcClient) => {
+      try {
+        const result = await rpc.request<{
+          data: ModelOption[];
+          nextCursor: string | null;
+        }>("model/list", {
+          limit: 100,
+          includeHidden: false,
+        });
+        setModels(result.data);
+        setModel(
+          (current) =>
+            current ||
+            result.data.find((entry) => entry.isDefault)?.model ||
+            result.data[0]?.model ||
+            "",
+        );
+        const selectedModel =
+          result.data.find((entry) => entry.model === model) ??
+          result.data.find((entry) => entry.isDefault) ??
+          result.data[0];
+        if (selectedModel)
+          setEffort(
+            (current) => current || selectedModel.defaultReasoningEffort,
+          );
+      } catch (error) {
+        setNotice({
+          tone: "error",
+          text: `Could not load models: ${shortError(error)}`,
+        });
+      }
+    },
+    [model],
+  );
+
+  const handleNotification = useCallback(
+    (method: string, params: Record<string, unknown>) => {
+      if (method === "error") {
+        const error = isRecord(params.error) ? params.error : params;
+        setNotice({
+          tone: "error",
+          text: asString(error.message, "Codex reported an error."),
+        });
+        return;
+      }
+      if (method === "thread/started" && isRecord(params.thread)) {
+        const newThread = params.thread as unknown as ThreadSummary;
+        setThreads((current) => [
+          newThread,
+          ...current.filter((entry) => entry.id !== newThread.id),
+        ]);
+        return;
+      }
+      if (method === "thread/name/updated") {
+        const threadId = asString(params.threadId);
+        const name = asString(params.name);
+        setThreads((current) =>
+          current.map((entry) =>
+            entry.id === threadId ? { ...entry, name } : entry,
+          ),
+        );
+        return;
+      }
+      if (method === "thread/archived" || method === "thread/unarchived") {
+        const threadId = asString(params.threadId);
+        setThreads((current) =>
+          current.filter((entry) => entry.id !== threadId),
+        );
+        return;
+      }
+      if (method === "serverRequest/resolved") {
+        setApprovalQueue((current) =>
+          current.filter((prompt) => prompt.id !== params.requestId),
+        );
+        return;
+      }
+
+      const threadId = asString(params.threadId);
+      if (threadId && threadId !== selectedRef.current) return;
+
+      if (method === "turn/started" && isRecord(params.turn)) {
+        const turn = params.turn;
+        setActiveTurnId(asString(turn.id) || null);
+        setTurnActive(true);
+        return;
+      }
+      if (method === "turn/completed" && isRecord(params.turn)) {
+        const turn = params.turn;
+        setTurnActive(false);
+        if (asString(turn.id) === activeTurnId) setActiveTurnId(null);
+        return;
+      }
+      if (method === "thread/status/changed") {
+        const status = params.status;
+        setTurnActive(isRecord(status) && status.type === "active");
+        return;
+      }
+
+      if (method === "item/started" || method === "item/completed") {
+        if (!isRecord(params.item) || typeof params.item.type !== "string")
+          return;
+        const next = params.item as ThreadItem;
+        liveItemsRef.current.add(next.id);
+        const turnId = asString(params.turnId);
+        setItems((current) => {
+          const found = current.findIndex((entry) => entry.item.id === next.id);
+          const replacement: TimelineItem = {
+            turnId,
+            item: next,
+            startedAtMs:
+              typeof params.startedAtMs === "number"
+                ? params.startedAtMs
+                : null,
+            completedAtMs:
+              typeof params.completedAtMs === "number"
+                ? params.completedAtMs
+                : null,
+            streaming: method === "item/started",
+          };
+          if (found < 0) return [...current, replacement];
+          const updated = [...current];
+          updated[found] = replacement;
+          return updated;
+        });
+        return;
+      }
+
+      if (
+        method === "item/agentMessage/delta" ||
+        method === "item/plan/delta" ||
+        method === "item/reasoning/textDelta" ||
+        method === "item/reasoning/summaryTextDelta"
+      ) {
+        const itemId = asString(params.itemId);
+        const delta = asString(params.delta);
+        if (!itemId || !delta) return;
+        liveItemsRef.current.add(itemId);
+        setItems((current) =>
+          updateItem(current, itemId, (item) => {
+            const key =
+              method === "item/plan/delta"
+                ? "text"
+                : method === "item/reasoning/textDelta"
+                  ? "content"
+                  : method === "item/reasoning/summaryTextDelta"
+                    ? "summary"
+                    : "text";
+            const prior = item[key];
+            if (Array.isArray(prior))
+              return { ...item, [key]: [...prior, delta] };
+            return { ...item, [key]: `${asString(prior)}${delta}` };
+          }),
+        );
+        return;
+      }
+      if (method === "item/commandExecution/outputDelta") {
+        const itemId = asString(params.itemId);
+        const delta = asString(params.delta);
+        liveItemsRef.current.add(itemId);
+        setItems((current) =>
+          updateItem(current, itemId, (item) => ({
+            ...item,
+            aggregatedOutput: `${asString(item.aggregatedOutput)}${delta}`,
+          })),
+        );
+        return;
+      }
+      if (method === "item/fileChange/patchUpdated") {
+        const itemId = asString(params.itemId);
+        if (!Array.isArray(params.changes)) return;
+        liveItemsRef.current.add(itemId);
+        setItems((current) =>
+          updateItem(current, itemId, (item) => ({
+            ...item,
+            changes: params.changes,
+          })),
+        );
+        return;
+      }
+    },
+    [activeTurnId],
+  );
+
+  const handleServerRequest = useCallback((request: ApprovalPrompt) => {
+    if (request.method === "item/tool/call") {
+      const name =
+        [request.params.namespace, request.params.tool]
+          .filter(Boolean)
+          .join("/") || "unnamed tool";
+      setNotice({
+        tone: "info",
+        text: `Codex requested client tool “${name}”. Review the request and return an unsupported response.`,
+      });
+    }
+    setApprovalQueue((current) => [...current, request]);
+  }, []);
+
+  const openThread = useCallback(
+    async (rpc: RpcClient, threadId: string, announce = false) => {
+      const version = ++loadVersionRef.current;
+      selectedRef.current = threadId;
+      if (announce) setMobileSidebarOpen(false);
+      const summary =
+        threadsRef.current.find((thread) => thread.id === threadId) ?? null;
+      setSelectedThread(summary);
+      setItems([]);
+      setThreadDetails(null);
+      setLoadingThread(true);
+      setItemCursor(null);
+      setActiveTurnId(null);
+      liveItemsRef.current.clear();
+      try {
+        const response = await rpc.request<
+          ThreadDetails & {
+            thread: ThreadDetails["thread"] & {
+              id: string;
+              name?: string | null;
+              preview?: string;
+              cwd?: string;
+            };
+          }
+        >("thread/resume", {
+          threadId,
+          excludeTurns: true,
+        });
+        if (version !== loadVersionRef.current) return;
+        setThreadDetails(response);
+        setCwd(response.cwd || summary?.cwd || "");
+        setModel(response.model || summary?.model || "");
+        setEffort(response.reasoningEffort || summary?.reasoningEffort || "");
+        setApprovalPolicy("");
+        setSandboxMode("");
+        setTurnActive(
+          isRecord(response.thread.status) &&
+            response.thread.status.type === "active",
+        );
+        setSelectedThread((current) => {
+          if (
+            version !== loadVersionRef.current ||
+            selectedRef.current !== threadId
+          ) {
+            return current;
+          }
+          const existing =
+            current?.id === threadId
+              ? current
+              : summary?.id === threadId
+                ? summary
+                : null;
+          return {
+            ...(existing ?? {
+              id: threadId,
+              name: null,
+              preview: "",
+              cwd: response.cwd,
+              updatedAt: Date.now() / 1000,
+              createdAt: Date.now() / 1000,
+              model: response.model,
+              reasoningEffort: response.reasoningEffort,
+              status: response.thread.status,
+              canAcceptDirectInput: null,
+            }),
+            cwd: response.cwd || existing?.cwd || "",
+            model: response.model || existing?.model || null,
+            reasoningEffort:
+              response.reasoningEffort ?? existing?.reasoningEffort ?? null,
+            status: response.thread.status,
+            name: response.thread.name ?? existing?.name ?? null,
+            preview: response.thread.preview ?? existing?.preview ?? "",
+          };
+        });
+
+        const [page, turnPage] = await Promise.all([
+          rpc.request<{ data: ThreadItemEntry[]; nextCursor: string | null }>(
+            "thread/items/list",
+            {
+              threadId,
+              limit: 50,
+              sortDirection: "desc",
+            },
+          ),
+          rpc.request<{
+            data: Array<{ id: string; status: string }>;
+            nextCursor: string | null;
+          }>("thread/turns/list", {
+            threadId,
+            limit: 5,
+            sortDirection: "desc",
+            itemsView: "notLoaded",
+          }),
+        ]);
+        if (version !== loadVersionRef.current) return;
+        const sorted = [...page.data].reverse().map((entry) => ({ ...entry }));
+        const merged = mergeHistoryWithLive(
+          sorted,
+          itemsRef.current,
+          liveItemsRef.current,
+        );
+        setItems(merged);
+        setItemCursor(page.nextCursor);
+        const activeTurn = turnPage.data.find(
+          (turn) => turn.status === "inProgress",
+        );
+        if (activeTurn) setActiveTurnId(activeTurn.id);
+        setLoadingThread(false);
+        sessionStorage.setItem(selectedThreadKey, threadId);
+        requestAnimationFrame(() => {
+          const view = timelineRef.current;
+          if (view) view.scrollTop = view.scrollHeight;
+        });
+      } catch (error) {
+        if (version !== loadVersionRef.current) return;
+        setLoadingThread(false);
+        setNotice({
+          tone: "error",
+          text: `Could not open conversation: ${shortError(error)}`,
+        });
+      }
+    },
+    [],
+  );
+
+  const onReady = useCallback(
+    (rpc: RpcClient) => {
+      ++sessionProbeEpochRef.current;
+      sessionProbeInFlightRef.current = null;
+      sessionProbeLastAtRef.current = 0;
+      sessionExpiredRef.current = false;
+      void loadModels(rpc);
+      void refreshThreads(rpc, archivedThreads, false);
+      if (selectedRef.current) void openThread(rpc, selectedRef.current, false);
+      else {
+        const saved = sessionStorage.getItem(selectedThreadKey);
+        if (saved) void openThread(rpc, saved, false);
+      }
+    },
+    [archivedThreads, loadModels, openThread, refreshThreads],
+  );
+
+  handlersRef.current = {
+    onNotification: handleNotification,
+    onServerRequest: handleServerRequest,
+    onDisconnected: checkSessionAfterDisconnect,
+    onReady,
+  };
+
+  useEffect(() => {
+    if (!status?.authenticated || !status.daemon.available) {
+      detach();
+      return;
+    }
+    attach({
+      onNotification: (method, params) =>
+        handlersRef.current.onNotification(method, params),
+      onServerRequest: (request) =>
+        handlersRef.current.onServerRequest(request),
+      onDisconnected: () => handlersRef.current.onDisconnected(),
+      onReady: (rpc) => handlersRef.current.onReady(rpc),
+    });
+    return detach;
+  }, [attach, detach, status?.authenticated, status?.daemon.available]);
+
+  const signIn = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setAuthBusy(true);
+    setAuthError("");
+    try {
+      const response = await fetch("/api/login", {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ token }),
+      });
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok)
+        throw new Error(
+          asString(
+            result.error ?? result.message,
+            "Could not sign in with that token.",
+          ),
+        );
+      sessionExpiredRef.current = false;
+      ++sessionProbeEpochRef.current;
+      sessionProbeInFlightRef.current = null;
+      sessionProbeLastAtRef.current = 0;
+      setToken("");
+      await refreshStatus();
+    } catch (error) {
+      setAuthError(shortError(error));
+    } finally {
+      setAuthBusy(false);
+    }
+  };
+
+  const signOut = async () => {
+    sessionExpiredRef.current = true;
+    ++sessionProbeEpochRef.current;
+    sessionProbeInFlightRef.current = null;
+    try {
+      await fetch("/api/logout", {
+        method: "POST",
+        credentials: "same-origin",
+      });
+    } catch {
+      setNotice({
+        tone: "error",
+        text: "The sign-out request could not reach the server.",
+      });
+    } finally {
+      detach();
+      selectedRef.current = null;
+      setStatus({ authenticated: false, daemon: { available: false } });
+      setThreads([]);
+      setSelectedThread(null);
+      setThreadDetails(null);
+      setItems([]);
+      sessionStorage.removeItem(selectedThreadKey);
+    }
+  };
+
+  const chooseThread = (thread: ThreadSummary) => {
+    if (!client) return;
+    void openThread(client, thread.id, true);
+  };
+
+  const newConversation = () => {
+    ++loadVersionRef.current;
+    selectedRef.current = null;
+    sessionStorage.removeItem(selectedThreadKey);
+    setSelectedThread(null);
+    setThreadDetails(null);
+    setItems([]);
+    setItemCursor(null);
+    setActiveTurnId(null);
+    setTurnActive(false);
+    setApprovalPolicy("");
+    setSandboxMode("");
+    setCwd(selectedThread?.cwd || threadDetails?.cwd || "");
+    setModel(
+      (current) =>
+        current ||
+        models.find((entry) => entry.isDefault)?.model ||
+        models[0]?.model ||
+        "",
+    );
+    setEffort(
+      (current) =>
+        current ||
+        models.find((entry) => entry.model === model)?.defaultReasoningEffort ||
+        "",
+    );
+    setMobileSidebarOpen(false);
+  };
+  newConversationRef.current = newConversation;
+
+  useEffect(() => {
+    const onShortcut = (event: KeyboardEvent) => {
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
+        event.preventDefault();
+        newConversationRef.current();
+      }
+    };
+    window.addEventListener("keydown", onShortcut);
+    return () => window.removeEventListener("keydown", onShortcut);
+  }, []);
+
+  const loadOlderItems = async () => {
+    if (!client || !selectedThread || !itemCursor) return;
+    const requestedThreadId = selectedThread.id;
+    setLoadingOlderItems(true);
+    const view = timelineRef.current;
+    const previousHeight = view?.scrollHeight ?? 0;
+    const previousTop = view?.scrollTop ?? 0;
+    try {
+      const page = await client.request<{
+        data: ThreadItemEntry[];
+        nextCursor: string | null;
+      }>("thread/items/list", {
+        threadId: requestedThreadId,
+        cursor: itemCursor,
+        limit: 50,
+        sortDirection: "desc",
+      });
+      if (selectedRef.current !== requestedThreadId) return;
+      const older = [...page.data].reverse().map((entry) => ({ ...entry }));
+      setItems((current) =>
+        mergeHistoryWithLive(
+          [...older, ...current],
+          current,
+          liveItemsRef.current,
+        ),
+      );
+      setItemCursor(page.nextCursor);
+      requestAnimationFrame(() => {
+        if (!view) return;
+        view.scrollTop = view.scrollHeight - previousHeight + previousTop;
+      });
+    } catch (error) {
+      setNotice({
+        tone: "error",
+        text: `Could not load earlier messages: ${shortError(error)}`,
+      });
+    } finally {
+      setLoadingOlderItems(false);
+    }
+  };
+
+  const selectModel = (nextModel: string) => {
+    setModel(nextModel);
+    const selected = models.find((entry) => entry.model === nextModel);
+    if (
+      selected &&
+      !selected.supportedReasoningEfforts.some(
+        (option) => option.reasoningEffort === effort,
+      )
+    ) {
+      setEffort(selected.defaultReasoningEffort);
+    }
+  };
+
+  const selectedModel = models.find((entry) => entry.model === model);
+  const availableEfforts = selectedModel?.supportedReasoningEfforts ?? [];
+  const filteredThreads = useMemo(() => {
+    const query = threadSearch.toLowerCase().trim();
+    if (!query) return threads;
+    return threads.filter((thread) =>
+      `${titleFor(thread)} ${thread.preview} ${thread.cwd}`
+        .toLowerCase()
+        .includes(query),
+    );
+  }, [threadSearch, threads]);
+
+  const sendMessage = async (event?: FormEvent<HTMLFormElement>) => {
+    event?.preventDefault();
+    if (
+      sending ||
+      compressingUploadsRef.current ||
+      (!composer.trim() && uploads.length === 0) ||
+      !client ||
+      connection !== "online"
+    )
+      return;
+    if (loadingThread || selectedRef.current !== (selectedThread?.id ?? null)) {
+      setNotice({
+        tone: "info",
+        text: "Wait for the selected conversation to finish loading before sending.",
+      });
+      return;
+    }
+    setSending(true);
+    setNotice(null);
+    const selectionAtSend = selectedRef.current;
+    let threadId = selectedThread?.id;
+    try {
+      const input: UserInput[] = [];
+      if (composer.trim())
+        input.push({ type: "text", text: composer.trim(), text_elements: [] });
+      for (const upload of uploads)
+        input.push({ type: "image", url: upload.dataUrl, detail: "auto" });
+
+      const turnParams: Record<string, unknown> = {
+        threadId: threadId ?? "00000000-0000-0000-0000-000000000000",
+        input,
+      };
+      if (model) turnParams.model = model;
+      if (effort) turnParams.effort = effort;
+      if (selectedThread && cwd.trim() && cwd !== selectedThread.cwd)
+        turnParams.cwd = cwd.trim();
+      if (approvalPolicy) turnParams.approvalPolicy = approvalPolicy;
+      if (sandboxMode && selectedThread) {
+        turnParams.sandboxPolicy = {
+          type:
+            sandboxMode === "read-only"
+              ? "readOnly"
+              : sandboxMode === "danger-full-access"
+                ? "dangerFullAccess"
+                : "workspaceWrite",
+          ...(sandboxMode === "read-only" ? { networkAccess: false } : {}),
+          ...(sandboxMode === "workspace-write"
+            ? {
+                writableRoots: [cwd.trim() || selectedThread.cwd || ""],
+                networkAccess: false,
+                excludeTmpdirEnvVar: false,
+                excludeSlashTmp: false,
+              }
+            : {}),
+        };
+      }
+
+      const requestBytes = serializedRequestBytes("turn/start", turnParams);
+      if (requestBytes > maxTurnRequestBytes) {
+        setNotice({
+          tone: "error",
+          text: `This message is too large for Codex (${Math.ceil(requestBytes / 1024)} KB; limit ${Math.floor(maxTurnRequestBytes / 1024)} KB). Remove an image or shorten the text.`,
+        });
+        return;
+      }
+
+      if (!threadId) {
+        const startParams: Record<string, unknown> = {};
+        if (model) startParams.model = model;
+        if (cwd.trim()) startParams.cwd = cwd.trim();
+        if (approvalPolicy) startParams.approvalPolicy = approvalPolicy;
+        if (sandboxMode) startParams.sandbox = sandboxMode;
+        const started = await client.request<{
+          thread: ThreadSummary;
+          model: string;
+          cwd: string;
+        }>("thread/start", startParams);
+        threadId = started.thread.id;
+        turnParams.threadId = threadId;
+        if (selectedRef.current === selectionAtSend) {
+          selectedRef.current = threadId;
+          setSelectedThread(started.thread);
+          setThreadDetails({
+            ...started,
+            approvalPolicy: approvalPolicy || null,
+            sandbox: sandboxMode
+              ? {
+                  type: sandboxMode.replace(/-([a-z])/g, (_, char: string) =>
+                    char.toUpperCase(),
+                  ),
+                }
+              : null,
+            activePermissionProfile: null,
+            reasoningEffort: effort || null,
+            thread: { status: { type: "idle" } },
+          });
+          sessionStorage.setItem(selectedThreadKey, threadId);
+        }
+        setThreads((current) => [
+          started.thread,
+          ...current.filter((entry) => entry.id !== threadId),
+        ]);
+      }
+
+      const actualRequestBytes = serializedRequestBytes(
+        "turn/start",
+        turnParams,
+      );
+      if (actualRequestBytes > maxTurnRequestBytes) {
+        setNotice({
+          tone: "error",
+          text: `This message is too large for Codex (${Math.ceil(actualRequestBytes / 1024)} KB; limit ${Math.floor(maxTurnRequestBytes / 1024)} KB). Remove an image or shorten the text.`,
+        });
+        return;
+      }
+      const response = await client.request<{
+        turn: { id: string; status: string };
+      }>("turn/start", turnParams);
+      if (selectedRef.current === threadId) {
+        setActiveTurnId(response.turn.id);
+        setTurnActive(response.turn.status === "inProgress");
+        setComposer("");
+        if (composerRef.current) composerRef.current.style.height = "39px";
+        setUploads([]);
+        setShowSettings(false);
+      }
+      void refreshThreads(client, archivedThreads, false);
+    } catch (error) {
+      setNotice({
+        tone: "error",
+        text: `Could not confirm that Codex started the turn. Check the conversation before retrying. ${shortError(error)}`,
+      });
+    } finally {
+      setSending(false);
+    }
+  };
+
+  const interruptTurn = async () => {
+    if (!client || !selectedThread || !activeTurnId || interrupting) return;
+    setInterrupting(true);
+    try {
+      await client.request("turn/interrupt", {
+        threadId: selectedThread.id,
+        turnId: activeTurnId,
+      });
+    } catch (error) {
+      setNotice({
+        tone: "error",
+        text: `Could not interrupt the turn: ${shortError(error)}`,
+      });
+    } finally {
+      setInterrupting(false);
+    }
+  };
+
+  const archiveThread = async (thread: ThreadSummary) => {
+    if (!client) return;
+    try {
+      await client.request(
+        archivedThreads ? "thread/unarchive" : "thread/archive",
+        { threadId: thread.id },
+      );
+      setThreads((current) =>
+        current.filter((entry) => entry.id !== thread.id),
+      );
+      if (selectedThread?.id === thread.id) newConversation();
+      setNotice({
+        tone: "success",
+        text: archivedThreads
+          ? "Conversation restored."
+          : "Conversation archived.",
+      });
+    } catch (error) {
+      setNotice({
+        tone: "error",
+        text: `Could not update conversation: ${shortError(error)}`,
+      });
+    }
+  };
+
+  const saveRename = async (threadId: string) => {
+    if (!client) return;
+    const name = renameValue.trim();
+    if (!name) return;
+    try {
+      await client.request("thread/name/set", { threadId, name });
+      setThreads((current) =>
+        current.map((entry) =>
+          entry.id === threadId ? { ...entry, name } : entry,
+        ),
+      );
+      if (selectedThread?.id === threadId)
+        setSelectedThread((current) =>
+          current ? { ...current, name } : current,
+        );
+      setRenameId(null);
+    } catch (error) {
+      setNotice({
+        tone: "error",
+        text: `Could not rename conversation: ${shortError(error)}`,
+      });
+    }
+  };
+
+  const addImages = async (files: FileList | null) => {
+    if (!files?.length || compressingUploadsRef.current) return;
+    const accepted = Array.from(files).filter((file) =>
+      file.type.startsWith("image/"),
+    );
+    if (!accepted.length) {
+      setNotice({ tone: "error", text: "Choose an image file to attach." });
+      return;
+    }
+    if (uploads.length + accepted.length > maxImageCount) {
+      setNotice({
+        tone: "error",
+        text: `Attach up to ${maxImageCount} images to one message.`,
+      });
+      return;
+    }
+    const tooLarge = accepted.find((file) => file.size > maxImageFileBytes);
+    if (tooLarge) {
+      setNotice({
+        tone: "error",
+        text: `${tooLarge.name} is over the 20 MB input limit.`,
+      });
+      return;
+    }
+    compressingUploadsRef.current = true;
+    setCompressingUploads(true);
+    try {
+      const converted: PendingUpload[] = [];
+      for (const file of accepted) {
+        converted.push({
+          id: crypto.randomUUID(),
+          name: file.name,
+          dataUrl: await compressImage(file),
+          size: file.size,
+        });
+      }
+      const combined = [...uploads, ...converted];
+      const attachmentBytes = combined.reduce(
+        (total, upload) =>
+          total + new TextEncoder().encode(upload.dataUrl).byteLength,
+        0,
+      );
+      if (attachmentBytes > maxAttachmentBytes) {
+        setNotice({
+          tone: "error",
+          text: "These compressed images exceed the 700 KB combined attachment limit. Remove an image or choose fewer images.",
+        });
+        return;
+      }
+      setUploads(combined);
+      setNotice(null);
+    } catch (error) {
+      setNotice({ tone: "error", text: shortError(error) });
+    } finally {
+      compressingUploadsRef.current = false;
+      setCompressingUploads(false);
+    }
+  };
+
+  const replyApproval = (result: unknown) => {
+    if (!approvalPrompt || !client) return;
+    client.respond(approvalPrompt.id, result);
+    setApprovalQueue((current) =>
+      current.filter((prompt) => prompt.id !== approvalPrompt.id),
+    );
+    setQuestionAnswers({});
+  };
+
+  const rejectUnknownRequest = () => {
+    if (!approvalPrompt || !client) return;
+    const error: RpcError = {
+      code: -32601,
+      message: "This web client declined an unsupported server request.",
+    };
+    client.reject(approvalPrompt.id, error);
+    setApprovalQueue((current) =>
+      current.filter((prompt) => prompt.id !== approvalPrompt.id),
+    );
+  };
+
+  useEffect(() => {
+    const view = timelineRef.current;
+    if (!view) return;
+    if (scrollWasNearBottom.current) view.scrollTop = view.scrollHeight;
+  }, [items]);
+
+  if (booting) return <LoadingScreen label="Connecting your workspace" />;
+  if (!status && statusError) {
+    return (
+      <UnavailableScreen
+        message={statusError}
+        retry={() => void refreshStatus()}
+      />
+    );
+  }
+  if (!status?.authenticated) {
+    return (
+      <LoginScreen
+        token={token}
+        setToken={setToken}
+        busy={authBusy}
+        error={authError || statusError}
+        onSubmit={signIn}
+      />
+    );
+  }
+
+  const selectedTitle = selectedThread
+    ? titleFor(selectedThread)
+    : "New conversation";
+  const currentConnection = status.daemon.available ? connection : "offline";
+  const canSubmit =
+    connection === "online" &&
+    !sending &&
+    !loadingThread &&
+    !compressingUploads &&
+    selectedRef.current === (selectedThread?.id ?? null) &&
+    Boolean(composer.trim() || uploads.length);
+
+  return (
+    <div className={`app-shell ${sidebarCollapsed ? "sidebar-collapsed" : ""}`}>
+      <div
+        className={`mobile-scrim ${mobileSidebarOpen ? "visible" : ""}`}
+        onClick={() => setMobileSidebarOpen(false)}
+      />
+      <aside
+        className={`sidebar ${mobileSidebarOpen ? "mobile-open" : ""}`}
+        aria-label="Conversation history"
+      >
+        <div className="sidebar-top">
+          <a
+            className="brand-lockup"
+            href="#home"
+            onClick={(event) => event.preventDefault()}
+          >
+            <span className="brand-mark">
+              <Code2 size={17} strokeWidth={2.2} />
+            </span>
+            <span className="brand-name">
+              Codex <span>Desk</span>
+            </span>
+          </a>
+          <button
+            className="icon-button sidebar-hide"
+            aria-label="Collapse sidebar"
+            onClick={() => setSidebarCollapsed(true)}
+          >
+            <PanelLeftClose size={17} />
+          </button>
+          <button
+            className="icon-button mobile-close"
+            aria-label="Close history"
+            onClick={() => setMobileSidebarOpen(false)}
+          >
+            <X size={18} />
+          </button>
+        </div>
+
+        <button className="new-chat-button" onClick={newConversation}>
+          <Plus size={16} strokeWidth={2.2} />
+          <span>New conversation</span>
+          <kbd>⌘ K</kbd>
+        </button>
+
+        <div className="history-controls">
+          <button
+            className={`history-tab ${!archivedThreads ? "active" : ""}`}
+            onClick={() => {
+              setArchivedThreads(false);
+              setThreadCursor(null);
+              if (client) void refreshThreads(client, false, false);
+            }}
+          >
+            Recent
+          </button>
+          <button
+            className={`history-tab ${archivedThreads ? "active" : ""}`}
+            onClick={() => {
+              setArchivedThreads(true);
+              setThreadCursor(null);
+              if (client) void refreshThreads(client, true, false);
+            }}
+          >
+            Archived
+          </button>
+        </div>
+
+        <label className="search-box">
+          <span className="sr-only">Search conversations</span>
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <circle cx="11" cy="11" r="7" />
+            <path d="m16.5 16.5 4 4" />
+          </svg>
+          <input
+            value={threadSearch}
+            onChange={(event) => setThreadSearch(event.target.value)}
+            placeholder="Find a conversation"
+          />
+        </label>
+
+        <div className="thread-list">
+          {filteredThreads.length === 0 ? (
+            <div className="thread-list-empty">
+              {threadSearch
+                ? "No matching conversations"
+                : archivedThreads
+                  ? "No archived conversations"
+                  : "Your recent work will appear here"}
+            </div>
+          ) : (
+            filteredThreads.map((thread) => (
+              <div
+                key={thread.id}
+                className={`thread-row ${selectedThread?.id === thread.id ? "selected" : ""}`}
+              >
+                {renameId === thread.id ? (
+                  <form
+                    className="rename-form"
+                    onSubmit={(event) => {
+                      event.preventDefault();
+                      void saveRename(thread.id);
+                    }}
+                  >
+                    <input
+                      autoFocus
+                      value={renameValue}
+                      onChange={(event) => setRenameValue(event.target.value)}
+                      onKeyDown={(event) => {
+                        if (event.key === "Escape") setRenameId(null);
+                      }}
+                      aria-label="Conversation name"
+                    />
+                    <button aria-label="Save name">
+                      <Check size={15} />
+                    </button>
+                  </form>
+                ) : (
+                  <>
+                    <button
+                      className="thread-select"
+                      onClick={() => chooseThread(thread)}
+                    >
+                      <span className="thread-name">{titleFor(thread)}</span>
+                      <span className="thread-preview">
+                        {thread.preview || thread.cwd}
+                      </span>
+                      <span className="thread-meta">
+                        <span>{formatRelativeTime(thread.updatedAt)}</span>
+                        <span>
+                          {thread.cwd.split("/").filter(Boolean).at(-1) ||
+                            thread.cwd}
+                        </span>
+                      </span>
+                    </button>
+                    <div className="thread-actions">
+                      <button
+                        className="thread-action"
+                        aria-label={`Rename ${titleFor(thread)}`}
+                        title="Rename"
+                        onClick={() => {
+                          setRenameId(thread.id);
+                          setRenameValue(
+                            thread.name ?? thread.preview.split("\n")[0] ?? "",
+                          );
+                        }}
+                      >
+                        <Pencil size={14} />
+                      </button>
+                      <button
+                        className="thread-action"
+                        aria-label={`${archivedThreads ? "Restore" : "Archive"} ${titleFor(thread)}`}
+                        title={archivedThreads ? "Restore" : "Archive"}
+                        onClick={() => void archiveThread(thread)}
+                      >
+                        <Archive size={14} />
+                      </button>
+                    </div>
+                  </>
+                )}
+              </div>
+            ))
+          )}
+          {threadCursor && (
+            <button
+              className="load-more-threads"
+              onClick={() =>
+                client && void refreshThreads(client, archivedThreads, true)
+              }
+            >
+              Load more
+            </button>
+          )}
+        </div>
+
+        <div className="sidebar-footer">
+          <div className={`daemon-state ${currentConnection}`}>
+            <span className="status-dot" />
+            <span>{statusLabel(currentConnection)}</span>
+          </div>
+          <button
+            className="profile-button"
+            onClick={() => void signOut()}
+            title="Sign out"
+          >
+            <span className="profile-avatar">C</span>
+            <span className="profile-copy">
+              <strong>Local daemon</strong>
+              <small>Sign out</small>
+            </span>
+            <MoreHorizontal size={17} />
+          </button>
+        </div>
+      </aside>
+
+      <main className="main-panel">
+        <header className="topbar">
+          {sidebarCollapsed ? (
+            <button
+              className="icon-button topbar-menu"
+              aria-label="Open history"
+              onClick={() => setSidebarCollapsed(false)}
+            >
+              <PanelLeftOpen size={18} />
+            </button>
+          ) : null}
+          <button
+            className="icon-button mobile-menu"
+            aria-label="Open history"
+            onClick={() => setMobileSidebarOpen(true)}
+          >
+            <Menu size={19} />
+          </button>
+          <div className="topbar-title">
+            <span className="desktop-title">{selectedTitle}</span>
+            <ChevronDown size={14} />
+          </div>
+          <div className="topbar-right">
+            <span className={`connection-pill ${currentConnection}`}>
+              <span className="status-dot" />
+              {statusLabel(currentConnection)}
+            </span>
+            <button
+              className="icon-button topbar-help"
+              aria-label="Connection details"
+              title={
+                connectionMessage || status.daemon.endpoint || "Codex daemon"
+              }
+              onClick={() =>
+                setNotice({
+                  tone: connection === "online" ? "info" : "error",
+                  text:
+                    connectionMessage ||
+                    status.daemon.error ||
+                    status.daemon.endpoint ||
+                    "Connected to your local Codex daemon.",
+                })
+              }
+            >
+              <CircleHelp size={17} />
+            </button>
+          </div>
+        </header>
+
+        {status.daemon.available ? null : (
+          <div className="daemon-banner" role="status">
+            <div className="daemon-banner-icon">
+              <Terminal size={17} />
+            </div>
+            <div>
+              <strong>Codex daemon unavailable</strong>
+              <span>
+                {status.daemon.error ||
+                  "Start the official Codex app server, then reconnect."}
+              </span>
+            </div>
+            <button
+              className="text-button"
+              onClick={() => void refreshStatus()}
+            >
+              Retry
+            </button>
+          </div>
+        )}
+
+        {connectionMessage &&
+        connection !== "online" &&
+        status.daemon.available ? (
+          <div className="connection-banner" role="status">
+            <span className="status-dot" />
+            {connectionMessage}
+          </div>
+        ) : null}
+
+        {notice ? (
+          <div
+            className={`notice ${notice.tone}`}
+            role={notice.tone === "error" ? "alert" : "status"}
+          >
+            <span>{notice.text}</span>
+            <button
+              aria-label="Dismiss message"
+              onClick={() => setNotice(null)}
+            >
+              <X size={15} />
+            </button>
+          </div>
+        ) : null}
+
+        <div
+          className="conversation-view"
+          ref={timelineRef}
+          onScroll={(event) => {
+            const element = event.currentTarget;
+            scrollWasNearBottom.current =
+              element.scrollHeight - element.scrollTop - element.clientHeight <
+              160;
+          }}
+        >
+          {selectedThread && itemCursor ? (
+            <button
+              className="load-history-button"
+              disabled={loadingOlderItems}
+              onClick={() => void loadOlderItems()}
+            >
+              {loadingOlderItems ? (
+                <LoaderCircle className="spin" size={15} />
+              ) : (
+                <ArrowUp size={15} />
+              )}
+              <span>Load earlier messages</span>
+            </button>
+          ) : null}
+          {loadingThread ? (
+            <div className="history-loading">
+              <LoaderCircle className="spin" size={18} />
+              Restoring conversation…
+            </div>
+          ) : null}
+          {!selectedThread && items.length === 0 ? (
+            <div className="welcome-state">
+              <div className="welcome-mark">
+                <Code2 size={23} />
+              </div>
+              <p className="eyebrow">YOUR CODEX WORKSPACE</p>
+              <h1>
+                What are we
+                <br />
+                <em>working on?</em>
+              </h1>
+              <p className="welcome-description">
+                Ask Codex to explore, build, or explain something in your
+                workspace.
+              </p>
+              <div className="suggestion-list">
+                <button
+                  onClick={() =>
+                    setComposer("Explain the structure of this project")
+                  }
+                >
+                  <span className="suggestion-icon">
+                    <FileText size={16} />
+                  </span>
+                  <span>
+                    <strong>Explore this project</strong>
+                    <small>Get a quick overview of the codebase</small>
+                  </span>
+                  <ChevronRight size={16} />
+                </button>
+                <button
+                  onClick={() =>
+                    setComposer(
+                      "Help me fix the most important issue in this codebase",
+                    )
+                  }
+                >
+                  <span className="suggestion-icon">
+                    <Command size={16} />
+                  </span>
+                  <span>
+                    <strong>Make a change</strong>
+                    <small>Describe a task and work through it</small>
+                  </span>
+                  <ChevronRight size={16} />
+                </button>
+              </div>
+            </div>
+          ) : null}
+          {items.map((entry) => (
+            <TimelineCard
+              key={`${entry.turnId}-${entry.item.id}`}
+              entry={entry}
+            />
+          ))}
+          {turnActive && !items.some((entry) => entry.streaming) ? (
+            <div className="thinking-indicator">
+              <span />
+              <span />
+              <span />
+              Codex is working
+            </div>
+          ) : null}
+        </div>
+
+        <div className="composer-wrap">
+          <form className="composer-card" onSubmit={sendMessage}>
+            {uploads.length ? (
+              <div className="upload-strip">
+                {uploads.map((upload) => (
+                  <div className="upload-chip" key={upload.id}>
+                    <img src={upload.dataUrl} alt="" />
+                    <span>{upload.name}</span>
+                    <button
+                      type="button"
+                      aria-label={`Remove ${upload.name}`}
+                      disabled={compressingUploads}
+                      onClick={() =>
+                        setUploads((current) =>
+                          current.filter((item) => item.id !== upload.id),
+                        )
+                      }
+                    >
+                      <X size={13} />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            ) : null}
+            <label className="sr-only" htmlFor="composer">
+              Message Codex
+            </label>
+            <textarea
+              ref={composerRef}
+              id="composer"
+              value={composer}
+              onChange={(event) => {
+                setComposer(event.target.value);
+                event.currentTarget.style.height = "auto";
+                event.currentTarget.style.height = `${event.currentTarget.scrollHeight}px`;
+              }}
+              onKeyDown={(event) => {
+                if (
+                  event.key === "Enter" &&
+                  !event.shiftKey &&
+                  !event.nativeEvent.isComposing
+                ) {
+                  event.preventDefault();
+                  void sendMessage();
+                }
+              }}
+              placeholder={
+                connection === "online"
+                  ? "Message Codex…"
+                  : "Waiting for the Codex connection…"
+              }
+              rows={1}
+              disabled={connection !== "online" || sending}
+            />
+            <div className="composer-toolbar">
+              <div className="composer-tools">
+                <label
+                  className="composer-tool attach-tool"
+                  title="Attach an image"
+                >
+                  <ImagePlus size={17} />
+                  <span className="sr-only">Attach image</span>
+                  <input
+                    type="file"
+                    accept="image/*"
+                    multiple
+                    disabled={compressingUploads || sending}
+                    onChange={(event) => {
+                      void addImages(event.currentTarget.files);
+                      event.currentTarget.value = "";
+                    }}
+                  />
+                </label>
+                <button
+                  type="button"
+                  className={`composer-tool ${showSettings ? "active" : ""}`}
+                  title="Model and permission options"
+                  aria-expanded={showSettings}
+                  onClick={() => setShowSettings((value) => !value)}
+                >
+                  <Shield size={16} />
+                  <span className="settings-label">Options</span>
+                  <ChevronDown size={13} />
+                </button>
+              </div>
+              <div className="composer-right">
+                <span className="composer-hint">
+                  Enter to send · Shift + Enter for a new line
+                </span>
+                {turnActive && activeTurnId ? (
+                  <button
+                    type="button"
+                    className="send-button stop-button"
+                    onClick={() => void interruptTurn()}
+                    disabled={interrupting}
+                    aria-label="Interrupt turn"
+                  >
+                    {interrupting ? (
+                      <LoaderCircle className="spin" size={16} />
+                    ) : (
+                      <Square size={13} fill="currentColor" />
+                    )}
+                  </button>
+                ) : (
+                  <button
+                    type="submit"
+                    className="send-button"
+                    disabled={!canSubmit}
+                    aria-label="Send message"
+                  >
+                    {sending ? (
+                      <LoaderCircle className="spin" size={17} />
+                    ) : (
+                      <ArrowUp size={18} strokeWidth={2.3} />
+                    )}
+                  </button>
+                )}
+              </div>
+            </div>
+            {showSettings ? (
+              <div className="settings-panel">
+                <div className="settings-panel-heading">
+                  <div>
+                    <strong>Run settings</strong>
+                    <span>Applied to the next turn.</span>
+                  </div>
+                  <button
+                    type="button"
+                    className="icon-button"
+                    aria-label="Close run settings"
+                    onClick={() => setShowSettings(false)}
+                  >
+                    <X size={16} />
+                  </button>
+                </div>
+                <div className="settings-grid">
+                  <label>
+                    <span>Model</span>
+                    <select
+                      value={model}
+                      onChange={(event) => selectModel(event.target.value)}
+                    >
+                      <option value="">Daemon default</option>
+                      {models.map((entry) => (
+                        <option key={entry.id} value={entry.model}>
+                          {entry.displayName || entry.model}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <label>
+                    <span>Reasoning</span>
+                    <select
+                      value={effort}
+                      onChange={(event) => setEffort(event.target.value)}
+                    >
+                      <option value="">Daemon default</option>
+                      {availableEfforts.map((option) => (
+                        <option
+                          key={option.reasoningEffort}
+                          value={option.reasoningEffort}
+                        >
+                          {capitalize(option.reasoningEffort)}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <label>
+                    <span>Approval policy</span>
+                    <select
+                      value={approvalPolicy}
+                      onChange={(event) =>
+                        setApprovalPolicy(event.target.value)
+                      }
+                    >
+                      <option value="">Keep current policy</option>
+                      <option value="on-request">On request</option>
+                      <option value="untrusted">Untrusted</option>
+                      <option value="never">Never</option>
+                    </select>
+                  </label>
+                  <label>
+                    <span>Sandbox</span>
+                    <select
+                      value={sandboxMode}
+                      onChange={(event) => setSandboxMode(event.target.value)}
+                    >
+                      <option value="">Keep current sandbox</option>
+                      <option value="read-only">Read only · network off</option>
+                      <option value="workspace-write">Workspace write</option>
+                      <option value="danger-full-access">Full access</option>
+                    </select>
+                  </label>
+                  {!selectedThread ? (
+                    <label className="cwd-setting">
+                      <span>Working directory</span>
+                      <input
+                        value={cwd}
+                        onChange={(event) => setCwd(event.target.value)}
+                        placeholder="/path/to/project"
+                        autoCapitalize="off"
+                        autoCorrect="off"
+                        spellCheck={false}
+                      />
+                      <small>Used when this conversation starts.</small>
+                      <small>
+                        Daemon permissions apply unless you choose an override.
+                      </small>
+                    </label>
+                  ) : (
+                    <div className="current-policy">
+                      <span>Current daemon policy</span>
+                      <strong>
+                        {describeApproval(threadDetails?.approvalPolicy)} ·{" "}
+                        {describeSandbox(threadDetails?.sandbox)}
+                      </strong>
+                      {threadDetails?.activePermissionProfile?.id ? (
+                        <small>
+                          Profile: {threadDetails.activePermissionProfile.id}
+                        </small>
+                      ) : (
+                        <small>New choices apply to your next turn.</small>
+                      )}
+                    </div>
+                  )}
+                </div>
+              </div>
+            ) : null}
+          </form>
+          <p className="composer-footnote">
+            Codex can make mistakes. Review commands and file changes before
+            accepting them.
+          </p>
+        </div>
+      </main>
+
+      {approvalPrompt ? (
+        <ApprovalDialog
+          prompt={approvalPrompt}
+          unknown={unknownRequest}
+          answers={questionAnswers}
+          setAnswers={setQuestionAnswers}
+          onReply={replyApproval}
+          onRejectUnknown={rejectUnknownRequest}
+        />
+      ) : null}
+    </div>
+  );
+}
+
+function LoginScreen({
+  token,
+  setToken,
+  busy,
+  error,
+  onSubmit,
+}: {
+  token: string;
+  setToken: (value: string) => void;
+  busy: boolean;
+  error: string;
+  onSubmit: (event: FormEvent<HTMLFormElement>) => void;
+}) {
+  return (
+    <div className="login-page">
+      <div className="login-ornament ornament-one" />
+      <div className="login-ornament ornament-two" />
+      <div className="login-card">
+        <div className="login-brand">
+          <span className="brand-mark">
+            <Code2 size={18} />
+          </span>
+          <span>
+            Codex <span>Desk</span>
+          </span>
+        </div>
+        <div className="login-icon">
+          <Command size={22} />
+        </div>
+        <p className="eyebrow">YOUR PRIVATE WORKSPACE</p>
+        <h1>Connect to Codex</h1>
+        <p className="login-description">
+          Enter your access token to open a secure connection to your Codex
+          daemon.
+        </p>
+        <form onSubmit={onSubmit}>
+          <label htmlFor="access-token">Access token</label>
+          <input
+            id="access-token"
+            type="password"
+            autoComplete="current-password"
+            value={token}
+            onChange={(event) => setToken(event.target.value)}
+            required
+            autoFocus
+            placeholder="Paste your token"
+          />
+          {error ? (
+            <p className="form-error" role="alert">
+              {error}
+            </p>
+          ) : null}
+          <button className="login-submit" disabled={busy || !token.trim()}>
+            {busy ? (
+              <>
+                <LoaderCircle className="spin" size={16} /> Connecting…
+              </>
+            ) : (
+              <>
+                Open workspace <ArrowUp size={16} />
+              </>
+            )}
+          </button>
+        </form>
+        <div className="login-security">
+          <Shield size={14} />
+          <span>
+            Your token stays on this server and is not stored in your browser.
+          </span>
+        </div>
+      </div>
+      <div className="login-footer">
+        A focused interface for the official Codex daemon
+      </div>
+    </div>
+  );
+}
+
+function LoadingScreen({ label }: { label: string }) {
+  return (
+    <div className="loading-screen">
+      <span className="brand-mark">
+        <Code2 size={18} />
+      </span>
+      <LoaderCircle className="spin" size={19} />
+      <span>{label}</span>
+    </div>
+  );
+}
+
+function UnavailableScreen({
+  message,
+  retry,
+}: {
+  message: string;
+  retry: () => void;
+}) {
+  return (
+    <div className="login-page">
+      <div className="login-card unavailable-card">
+        <div className="login-brand">
+          <span className="brand-mark">
+            <Code2 size={18} />
+          </span>
+          <span>
+            Codex <span>Desk</span>
+          </span>
+        </div>
+        <div className="login-icon">
+          <Terminal size={21} />
+        </div>
+        <p className="eyebrow">WORKSPACE CONNECTION</p>
+        <h1>Can’t reach the server</h1>
+        <p className="login-description">{message}</p>
+        <button className="login-submit" onClick={retry}>
+          Try again <ArrowUp size={16} />
+        </button>
+      </div>
+      <div className="login-footer">
+        A focused interface for the official Codex daemon
+      </div>
+    </div>
+  );
+}
+
+function TimelineCard({ entry }: { entry: TimelineItem }) {
+  const item = entry.item;
+  if (item.type === "userMessage") {
+    const content = Array.isArray(item.content)
+      ? (item.content as Array<Record<string, unknown>>)
+      : [];
+    return (
+      <article className="message-row user-row">
+        <div className="user-message-bubble">
+          {content.map((part, index) => (
+            <UserInputPart key={index} part={part} />
+          ))}
+        </div>
+      </article>
+    );
+  }
+  if (item.type === "agentMessage") {
+    const text = asString(item.text);
+    return (
+      <article className="message-row assistant-row">
+        <div className="assistant-mark">
+          <Code2 size={15} />
+        </div>
+        <div className="assistant-content">
+          <div className="assistant-byline">
+            Codex
+            {entry.streaming ? (
+              <span className="live-label">
+                <i /> Writing
+              </span>
+            ) : null}
+          </div>
+          <MarkdownContent text={text} />
+          {item.delivery === "failed" ? (
+            <p className="delivery-error">
+              This response could not be delivered.
+            </p>
+          ) : null}
+        </div>
+      </article>
+    );
+  }
+  if (item.type === "commandExecution") {
+    return (
+      <details className="activity-card">
+        <summary>
+          <span className="activity-icon command">
+            <Terminal size={14} />
+          </span>
+          <span className="activity-title">Ran command</span>
+          <span
+            className={`activity-status ${(item.status as string) === "completed" ? "complete" : "running"}`}
+          >
+            {capitalize(asString(item.status, "running"))}
+          </span>
+          <ChevronDown className="activity-chevron" size={15} />
+        </summary>
+        <div className="activity-body">
+          <div className="code-heading">
+            <span>COMMAND</span>
+            <span>{asString(item.cwd)}</span>
+          </div>
+          <pre>
+            <code>{asString(item.command)}</code>
+          </pre>
+          {asString(item.aggregatedOutput) ? (
+            <>
+              <div className="code-heading">
+                <span>OUTPUT</span>
+                {typeof item.exitCode === "number" ? (
+                  <span>exit {item.exitCode}</span>
+                ) : null}
+              </div>
+              <pre>
+                <code>{asString(item.aggregatedOutput)}</code>
+              </pre>
+            </>
+          ) : null}
+        </div>
+      </details>
+    );
+  }
+  if (item.type === "fileChange") {
+    const changes = Array.isArray(item.changes)
+      ? (item.changes as Array<Record<string, unknown>>)
+      : [];
+    return (
+      <details className="activity-card">
+        <summary>
+          <span className="activity-icon file">
+            <FilePlus2 size={14} />
+          </span>
+          <span className="activity-title">File changes</span>
+          <span className="activity-count">
+            {changes.length} {changes.length === 1 ? "file" : "files"}
+          </span>
+          <ChevronDown className="activity-chevron" size={15} />
+        </summary>
+        <div className="activity-body file-change-list">
+          {changes.map((change, index) => (
+            <details
+              className="file-change"
+              key={`${asString(change.path)}-${index}`}
+            >
+              <summary>
+                <span className="change-kind">
+                  {capitalize(asString(change.kind, "update"))}
+                </span>
+                <code>{asString(change.path)}</code>
+                <ChevronDown className="activity-chevron" size={14} />
+              </summary>
+              <pre>
+                <code>{asString(change.diff, "Diff unavailable")}</code>
+              </pre>
+            </details>
+          ))}
+        </div>
+      </details>
+    );
+  }
+  if (item.type === "reasoning") {
+    const summary = Array.isArray(item.summary) ? item.summary.join("\n") : "";
+    const reasoning = Array.isArray(item.content)
+      ? item.content.join("\n")
+      : "";
+    return (
+      <details className="reasoning-card">
+        <summary>
+          <span className="reasoning-spark">✳</span>
+          <span>Reasoning</span>
+          <ChevronDown className="activity-chevron" size={14} />
+        </summary>
+        <div className="reasoning-body">
+          <MarkdownContent
+            text={
+              summary || reasoning || "Reasoning details are not available."
+            }
+          />
+        </div>
+      </details>
+    );
+  }
+  if (item.type === "plan")
+    return (
+      <details className="activity-card plan-card">
+        <summary>
+          <span className="activity-icon plan">
+            <FileText size={14} />
+          </span>
+          <span className="activity-title">Plan</span>
+          <ChevronDown className="activity-chevron" size={15} />
+        </summary>
+        <div className="activity-body">
+          <MarkdownContent text={asString(item.text)} />
+        </div>
+      </details>
+    );
+  if (
+    item.type === "mcpToolCall" ||
+    item.type === "dynamicToolCall" ||
+    item.type === "functionCallOutput"
+  )
+    return <ToolActivity item={item} />;
+  if (item.type === "webSearch")
+    return (
+      <details className="activity-card">
+        <summary>
+          <span className="activity-icon search">
+            <CircleHelp size={14} />
+          </span>
+          <span className="activity-title">Web search</span>
+          <ChevronDown className="activity-chevron" size={15} />
+        </summary>
+        <div className="activity-body">
+          <pre>
+            <code>{formatUnknown(item)}</code>
+          </pre>
+        </div>
+      </details>
+    );
+  if (item.type === "contextCompaction")
+    return <div className="system-item">Context summarized</div>;
+  if (
+    [
+      "sleep",
+      "enteredReviewMode",
+      "exitedReviewMode",
+      "subAgentActivity",
+      "collabAgentToolCall",
+      "imageView",
+      "imageGeneration",
+      "hookPrompt",
+    ].includes(item.type)
+  )
+    return <ToolActivity item={item} />;
+  return <ToolActivity item={item} />;
+}
+
+function UserInputPart({ part }: { part: Record<string, unknown> }) {
+  if (part.type === "text")
+    return <div className="user-text">{asString(part.text)}</div>;
+  if (part.type === "image") {
+    const url = safeImageUrl(part.url);
+    return url ? (
+      <a className="user-image" href={url} target="_blank" rel="noreferrer">
+        <img src={url} alt="Attached image" />
+      </a>
+    ) : (
+      <span className="unsupported-attachment">Image attachment</span>
+    );
+  }
+  if (part.type === "localImage")
+    return (
+      <span className="unsupported-attachment">
+        Image · {asString(part.path).split("/").at(-1)}
+      </span>
+    );
+  if (part.type === "audio" || part.type === "localAudio")
+    return <span className="unsupported-attachment">Audio attachment</span>;
+  if (part.type === "skill")
+    return <span className="user-chip">Skill · {asString(part.name)}</span>;
+  if (part.type === "mention")
+    return <span className="user-chip">@{asString(part.name)}</span>;
+  return null;
+}
+
+function ToolActivity({ item }: { item: ThreadItem }) {
+  const type = item.type;
+  const title =
+    type === "mcpToolCall"
+      ? `${asString(item.server)} · ${asString(item.tool)}`
+      : type === "dynamicToolCall"
+        ? `${asString(item.namespace) ? `${asString(item.namespace)}/` : ""}${asString(item.tool)}`
+        : type === "functionCallOutput"
+          ? asString(item.name, "Tool output")
+          : type === "collabAgentToolCall"
+            ? asString(item.tool, "Agent handoff")
+            : type === "subAgentActivity"
+              ? "Sub-agent activity"
+              : type === "hookPrompt"
+                ? "Instruction hook"
+                : type === "imageGeneration"
+                  ? "Image generation"
+                  : type === "imageView"
+                    ? "Viewed image"
+                    : type === "enteredReviewMode"
+                      ? "Review started"
+                      : type === "exitedReviewMode"
+                        ? "Review complete"
+                        : type === "sleep"
+                          ? "Wait"
+                          : "Tool activity";
+  return (
+    <details className="activity-card">
+      <summary>
+        <span className="activity-icon tool">
+          <Command size={14} />
+        </span>
+        <span className="activity-title">{title}</span>
+        <span className="activity-status">
+          {capitalize(asString(item.status, "details"))}
+        </span>
+        <ChevronDown className="activity-chevron" size={15} />
+      </summary>
+      <div className="activity-body">
+        <pre>
+          <code>{formatUnknown(item)}</code>
+        </pre>
+      </div>
+    </details>
+  );
+}
+
+function MarkdownContent({ text }: { text: string }) {
+  return (
+    <div className="markdown-content">
+      <ReactMarkdown remarkPlugins={[remarkGfm]}>{text}</ReactMarkdown>
+    </div>
+  );
+}
+
+function ApprovalDialog({
+  prompt,
+  unknown,
+  answers,
+  setAnswers,
+  onReply,
+  onRejectUnknown,
+}: {
+  prompt: ApprovalPrompt;
+  unknown: boolean;
+  answers: Record<string, string[]>;
+  setAnswers: (answers: Record<string, string[]>) => void;
+  onReply: (result: unknown) => void;
+  onRejectUnknown: () => void;
+}) {
+  const params = prompt.params;
+  const dialogRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    dialogRef.current?.focus();
+  }, []);
+  const method = prompt.method;
+  const decisionEntries = Array.isArray(params.availableDecisions)
+    ? params.availableDecisions
+    : null;
+  if (unknown)
+    return (
+      <div className="modal-scrim">
+        <div
+          className="approval-modal"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="approval-title"
+          tabIndex={-1}
+          ref={dialogRef}
+        >
+          <div className="approval-icon unknown">
+            <CircleHelp size={19} />
+          </div>
+          <p className="eyebrow">UNSUPPORTED REQUEST</p>
+          <h2 id="approval-title">Codex needs a response</h2>
+          <p className="approval-description">
+            This client does not have a handler for this server request. Review
+            its details, then decline it so the turn can continue.
+          </p>
+          <div className="request-details">
+            <strong>{method}</strong>
+            <pre>{formatUnknown(params)}</pre>
+          </div>
+          <div className="approval-actions">
+            <button className="secondary-action" onClick={onRejectUnknown}>
+              Decline request
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+
+  if (method === "item/tool/requestUserInput") {
+    const questions = Array.isArray(params.questions)
+      ? (params.questions as Array<Record<string, unknown>>)
+      : [];
+    return (
+      <div className="modal-scrim">
+        <div
+          className="approval-modal input-modal"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="approval-title"
+          tabIndex={-1}
+          ref={dialogRef}
+        >
+          <div className="approval-icon input">
+            <MessageSquareText size={19} />
+          </div>
+          <p className="eyebrow">CODEX NEEDS YOUR INPUT</p>
+          <h2 id="approval-title">A few questions</h2>
+          <div className="questions-list">
+            {questions.map((question) => (
+              <div className="question-block" key={asString(question.id)}>
+                <h3>{asString(question.header, "Question")}</h3>
+                <p>{asString(question.question)}</p>
+                {Array.isArray(question.options) && question.options.length ? (
+                  <div className="question-options">
+                    {(question.options as Array<Record<string, unknown>>).map(
+                      (option) => {
+                        const label = asString(option.label);
+                        const selected = (
+                          answers[asString(question.id)] ?? []
+                        ).includes(label);
+                        return (
+                          <button
+                            key={label}
+                            className={`question-option ${selected ? "selected" : ""}`}
+                            onClick={() =>
+                              setAnswers({
+                                ...answers,
+                                [asString(question.id)]: selected
+                                  ? (
+                                      answers[asString(question.id)] ?? []
+                                    ).filter((entry) => entry !== label)
+                                  : [
+                                      ...(answers[asString(question.id)] ?? []),
+                                      label,
+                                    ],
+                              })
+                            }
+                          >
+                            <span className="option-check">
+                              {selected ? <Check size={13} /> : null}
+                            </span>
+                            <span>
+                              <strong>{label}</strong>
+                              <small>{asString(option.description)}</small>
+                            </span>
+                          </button>
+                        );
+                      },
+                    )}
+                  </div>
+                ) : null}
+                {question.isOther ||
+                !Array.isArray(question.options) ||
+                question.options.length === 0 ? (
+                  <input
+                    className="other-answer"
+                    type={question.isSecret ? "password" : "text"}
+                    aria-label={`${question.isOther && Array.isArray(question.options) && question.options.length ? "Other answer" : "Answer"} for ${asString(question.header)}`}
+                    placeholder={
+                      question.isOther &&
+                      Array.isArray(question.options) &&
+                      question.options.length
+                        ? "Other answer"
+                        : "Your answer"
+                    }
+                    value={
+                      (answers[asString(question.id)] ?? [])
+                        .find((entry) => entry.startsWith("other:"))
+                        ?.slice(6) ?? ""
+                    }
+                    onChange={(event) => {
+                      const rest = (
+                        answers[asString(question.id)] ?? []
+                      ).filter((entry) => !entry.startsWith("other:"));
+                      setAnswers({
+                        ...answers,
+                        [asString(question.id)]: event.target.value
+                          ? [...rest, `other:${event.target.value}`]
+                          : rest,
+                      });
+                    }}
+                  />
+                ) : null}
+              </div>
+            ))}
+          </div>
+          <div className="approval-actions">
+            <button
+              className="secondary-action"
+              onClick={() => onReply({ answers: {} })}
+            >
+              Skip
+            </button>
+            <button
+              className="primary-action"
+              onClick={() => {
+                const normalized = Object.fromEntries(
+                  Object.entries(answers).map(([id, choices]) => [
+                    id,
+                    choices.map((choice) =>
+                      choice.startsWith("other:") ? choice.slice(6) : choice,
+                    ),
+                  ]),
+                );
+                onReply({
+                  answers: Object.fromEntries(
+                    Object.entries(normalized).map(([id, values]) => [
+                      id,
+                      { answers: values },
+                    ]),
+                  ),
+                });
+              }}
+            >
+              Send answers
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (method === "item/tool/call") {
+    const toolName =
+      [params.namespace, params.tool].filter(Boolean).join("/") ||
+      "unnamed tool";
+    return (
+      <div className="modal-scrim">
+        <div
+          className="approval-modal"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="approval-title"
+          tabIndex={-1}
+          ref={dialogRef}
+        >
+          <div className="approval-icon unknown">
+            <Command size={19} />
+          </div>
+          <p className="eyebrow">CLIENT TOOL REQUEST</p>
+          <h2 id="approval-title">Tool unavailable here</h2>
+          <p className="approval-description">
+            The daemon requested a client-owned tool. This web client does not
+            execute dynamic tools.
+          </p>
+          <div className="request-details">
+            <strong>{toolName}</strong>
+            <pre>{formatUnknown(params.arguments)}</pre>
+          </div>
+          <div className="approval-actions">
+            <button
+              className="primary-action"
+              onClick={() =>
+                onReply({
+                  success: false,
+                  contentItems: [
+                    {
+                      type: "inputText",
+                      text: "This client does not support this dynamic tool call.",
+                    },
+                  ],
+                })
+              }
+            >
+              Return unsupported response
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (method === "item/commandExecution/requestApproval") {
+    const choices = decisionEntries?.length
+      ? decisionEntries
+      : ["accept", "acceptForSession", "decline", "cancel"];
+    return (
+      <div className="modal-scrim">
+        <div
+          className="approval-modal"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="approval-title"
+          tabIndex={-1}
+          ref={dialogRef}
+        >
+          <div className="approval-icon command">
+            <Terminal size={19} />
+          </div>
+          <p className="eyebrow">COMMAND APPROVAL</p>
+          <h2 id="approval-title">Allow this command?</h2>
+          {params.reason ? (
+            <p className="approval-description">{asString(params.reason)}</p>
+          ) : null}
+          <div className="request-details">
+            <div className="approval-meta">
+              <span>Working directory</span>
+              <code>{asString(params.cwd, "Not provided")}</code>
+            </div>
+            <pre>{asString(params.command, "Command details unavailable")}</pre>
+            {Array.isArray(params.commandActions) &&
+            params.commandActions.length ? (
+              <details>
+                <summary>Command actions</summary>
+                <pre>{formatUnknown(params.commandActions)}</pre>
+              </details>
+            ) : null}
+          </div>
+          <div className="approval-actions approval-actions-wrap">
+            {choices.map((choice, index) => (
+              <button
+                className={
+                  decisionName(choice) === "decline" ||
+                  decisionName(choice) === "cancel"
+                    ? "secondary-action"
+                    : index === 0
+                      ? "primary-action"
+                      : "secondary-action"
+                }
+                key={JSON.stringify(choice)}
+                onClick={() => onReply({ decision: choice })}
+              >
+                {decisionLabel(choice)}
+              </button>
+            ))}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (method === "item/fileChange/requestApproval") {
+    const context = [
+      asString(params.reason),
+      params.grantRoot ? `Requested root: ${asString(params.grantRoot)}` : "",
+    ]
+      .filter(Boolean)
+      .join(" · ");
+    return (
+      <div className="modal-scrim">
+        <div
+          className="approval-modal"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="approval-title"
+          tabIndex={-1}
+          ref={dialogRef}
+        >
+          <div className="approval-icon file">
+            <FilePlus2 size={19} />
+          </div>
+          <p className="eyebrow">FILE CHANGE APPROVAL</p>
+          <h2 id="approval-title">Allow these file changes?</h2>
+          <p className="approval-description">
+            {context || "Codex is requesting permission to write files."}
+          </p>
+          <div className="request-details">
+            <strong>Thread {asString(params.threadId).slice(0, 12)}</strong>
+            <p>
+              Review the proposed patch in the conversation before allowing the
+              write.
+            </p>
+          </div>
+          <div className="approval-actions">
+            <button
+              className="secondary-action"
+              onClick={() => onReply({ decision: "decline" })}
+            >
+              Decline
+            </button>
+            <button
+              className="secondary-action"
+              onClick={() => onReply({ decision: "acceptForSession" })}
+            >
+              Allow this session
+            </button>
+            <button
+              className="primary-action"
+              onClick={() => onReply({ decision: "accept" })}
+            >
+              Allow once
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (method === "item/permissions/requestApproval") {
+    const permissions = isRecord(params.permissions) ? params.permissions : {};
+    return (
+      <div className="modal-scrim">
+        <div
+          className="approval-modal"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="approval-title"
+          tabIndex={-1}
+          ref={dialogRef}
+        >
+          <div className="approval-icon permission">
+            <Shield size={19} />
+          </div>
+          <p className="eyebrow">ADDITIONAL PERMISSIONS</p>
+          <h2 id="approval-title">Review requested access</h2>
+          {params.reason ? (
+            <p className="approval-description">{asString(params.reason)}</p>
+          ) : null}
+          <div className="request-details">
+            <div className="approval-meta">
+              <span>Working directory</span>
+              <code>{asString(params.cwd, "Not provided")}</code>
+            </div>
+            <pre>{formatUnknown(permissions)}</pre>
+          </div>
+          <div className="approval-actions">
+            <button
+              className="secondary-action"
+              onClick={() => onReply({ permissions: {}, scope: "turn" })}
+            >
+              Decline
+            </button>
+            <button
+              className="secondary-action"
+              onClick={() => onReply({ permissions, scope: "session" })}
+            >
+              Allow this session
+            </button>
+            <button
+              className="primary-action"
+              onClick={() => onReply({ permissions, scope: "turn" })}
+            >
+              Allow this turn
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+  return null;
+}
+
+function decisionName(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (isRecord(value)) return Object.keys(value)[0] ?? "choice";
+  return "choice";
+}
+
+function decisionLabel(value: unknown): string {
+  const labels: Record<string, string> = {
+    accept: "Allow once",
+    acceptForSession: "Allow this session",
+    decline: "Decline",
+    cancel: "Cancel",
+    acceptWithExecpolicyAmendment: "Allow and remember rule",
+    applyNetworkPolicyAmendment: "Apply network rule",
+  };
+  return labels[decisionName(value)] ?? decisionName(value);
+}
+
+function updateItem(
+  items: TimelineItem[],
+  itemId: string,
+  update: (item: ThreadItem) => ThreadItem,
+): TimelineItem[] {
+  if (!itemId) return items;
+  const index = items.findIndex((entry) => entry.item.id === itemId);
+  if (index < 0) return items;
+  const next = [...items];
+  next[index] = {
+    ...next[index],
+    item: update(next[index].item),
+    streaming: true,
+  };
+  return next;
+}
+
+function mergeHistoryWithLive(
+  history: TimelineItem[],
+  live: TimelineItem[],
+  liveIds: Set<string>,
+): TimelineItem[] {
+  const byId = new Map(history.map((entry) => [entry.item.id, entry]));
+  for (const entry of live)
+    if (liveIds.has(entry.item.id)) byId.set(entry.item.id, entry);
+  return Array.from(byId.values()).sort(
+    (a, b) => (a.startedAtMs ?? 0) - (b.startedAtMs ?? 0),
+  );
+}
+
+function formatUnknown(value: unknown): string {
+  try {
+    return JSON.stringify(value, null, 2) ?? String(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function capitalize(value: string): string {
+  return value ? value[0].toUpperCase() + value.slice(1) : value;
+}
+
+function formatRelativeTime(timestamp: number): string {
+  const seconds = Math.max(0, Math.floor(Date.now() / 1000 - timestamp));
+  if (seconds < 60) return "now";
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
+  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h`;
+  if (seconds < 604800) return `${Math.floor(seconds / 86400)}d`;
+  return new Date(timestamp * 1000).toLocaleDateString(undefined, {
+    month: "short",
+    day: "numeric",
+  });
+}

@@ -1,0 +1,40 @@
+{
+  "name": "codex-daemon-web",
+  "version": "0.1.0",
+  "private": false,
+  "packageManager": "pnpm@12.10.1",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "cross-env NODE_ENV=development concurrently -k -n server,client -c blue,green \"tsx watch server/index.ts\" \"vite --host 127.0.0.1 --strictPort\"",
+    "build": "tsc -b tsconfig.server.json tsconfig.app.json tsconfig.node.json && vite build",
+    "start": "node dist/server/index.js",
+    "check": "tsc -b tsconfig.server.json tsconfig.app.json tsconfig.node.json --pretty false"
+  },
+  "dependencies": {
+    "dotenv": "^16.6.1",
+    "express": "^5.1.0",
+    "lucide-react": "^0.468.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "react-markdown": "^9.0.1",
+    "remark-gfm": "^4.0.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@types/ws": "^8.5.0",
+    "@vitejs/plugin-react": "^4.3.4",
+    "concurrently": "^9.1.0",
+    "cross-env": "^7.0.3",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.0"
+  }
+}
