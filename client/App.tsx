@@ -30,6 +30,7 @@ import {
   useRef,
   useState,
   type FormEvent,
+  type PointerEvent as ReactPointerEvent,
 } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -168,6 +169,18 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function asString(value: unknown, fallback = ""): string {
   return typeof value === "string" ? value : fallback;
+}
+
+function userInputFromDraft(
+  text: string,
+  uploads: PendingUpload[],
+): UserInput[] {
+  const input: UserInput[] = [];
+  if (text.trim())
+    input.push({ type: "text", text: text.trim(), text_elements: [] });
+  for (const upload of uploads)
+    input.push({ type: "image", url: upload.dataUrl, detail: "auto" });
+  return input;
 }
 
 function shortError(error: unknown): string {
@@ -453,6 +466,16 @@ export default function App() {
   const [compressingUploads, setCompressingUploads] = useState(false);
   const compressingUploadsRef = useRef(false);
   const [sending, setSending] = useState(false);
+  const [queueing, setQueueing] = useState(false);
+  const queueingRef = useRef(false);
+  const queueAttemptRef = useRef<{
+    key: string;
+    clientUserMessageId: string;
+  } | null>(null);
+  const steerAttemptRef = useRef<{
+    key: string;
+    clientUserMessageId: string;
+  } | null>(null);
   const [interrupting, setInterrupting] = useState(false);
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
@@ -483,6 +506,85 @@ export default function App() {
   const newConversationRef = useRef<
     (historyMode?: "push" | "replace" | "none") => void
   >(() => {});
+
+  useEffect(() => {
+    const root = document.documentElement;
+    const viewport = window.visualViewport;
+    let animationFrame = 0;
+    let focusedTextControl = false;
+    let heightBeforeFocus = viewport?.height ?? window.innerHeight;
+    let previousWindowWidth = window.innerWidth;
+
+    const isTextControl = (element: EventTarget | null): boolean => {
+      if (element instanceof HTMLTextAreaElement) return true;
+      if (!(element instanceof HTMLInputElement)) return false;
+      return [
+        "email",
+        "number",
+        "password",
+        "search",
+        "tel",
+        "text",
+        "url",
+      ].includes(element.type);
+    };
+
+    const updateViewport = () => {
+      cancelAnimationFrame(animationFrame);
+      animationFrame = requestAnimationFrame(() => {
+        const height = viewport?.height ?? window.innerHeight;
+        const offsetTop = viewport?.offsetTop ?? 0;
+        const mobileViewport = window.matchMedia(
+          "(pointer: coarse), (max-width: 760px)",
+        ).matches;
+        const windowWidth = window.innerWidth;
+        if (Math.abs(windowWidth - previousWindowWidth) > 120)
+          heightBeforeFocus = height;
+        previousWindowWidth = windowWidth;
+        focusedTextControl = isTextControl(document.activeElement);
+        root.style.setProperty("--app-viewport-height", `${height}px`);
+        root.style.setProperty("--app-viewport-offset-top", `${offsetTop}px`);
+        const keyboardVisible =
+          mobileViewport &&
+          focusedTextControl &&
+          heightBeforeFocus - height > 120;
+        root.dataset.keyboardVisible = String(keyboardVisible);
+      });
+    };
+
+    const handleFocusIn = (event: FocusEvent) => {
+      if (!isTextControl(event.target)) return;
+      if (!focusedTextControl) {
+        heightBeforeFocus = viewport?.height ?? window.innerHeight;
+      }
+      focusedTextControl = true;
+      updateViewport();
+    };
+
+    const handleFocusOut = () => {
+      updateViewport();
+    };
+
+    window.addEventListener("resize", updateViewport);
+    window.addEventListener("scroll", updateViewport, { passive: true });
+    viewport?.addEventListener("resize", updateViewport);
+    viewport?.addEventListener("scroll", updateViewport);
+    document.addEventListener("focusin", handleFocusIn);
+    document.addEventListener("focusout", handleFocusOut);
+    updateViewport();
+    return () => {
+      cancelAnimationFrame(animationFrame);
+      window.removeEventListener("resize", updateViewport);
+      window.removeEventListener("scroll", updateViewport);
+      viewport?.removeEventListener("resize", updateViewport);
+      viewport?.removeEventListener("scroll", updateViewport);
+      document.removeEventListener("focusin", handleFocusIn);
+      document.removeEventListener("focusout", handleFocusOut);
+      delete root.dataset.keyboardVisible;
+      root.style.removeProperty("--app-viewport-height");
+      root.style.removeProperty("--app-viewport-offset-top");
+    };
+  }, []);
 
   useEffect(() => {
     if (connection !== "online") {
@@ -753,13 +855,18 @@ export default function App() {
       }
       if (method === "turn/completed" && isRecord(params.turn)) {
         const turn = params.turn;
-        setTurnActive(false);
-        if (asString(turn.id) === activeTurnId) setActiveTurnId(null);
+        const completedTurnId = asString(turn.id);
+        if (!activeTurnId || completedTurnId === activeTurnId) {
+          setTurnActive(false);
+          setActiveTurnId(null);
+        }
         return;
       }
       if (method === "thread/status/changed") {
         const status = params.status;
-        setTurnActive(isRecord(status) && status.type === "active");
+        const isActive = isRecord(status) && status.type === "active";
+        setTurnActive(isActive);
+        if (!isActive) setActiveTurnId(null);
         return;
       }
 
@@ -1452,7 +1559,10 @@ export default function App() {
     );
   }, [threadSearch, threads]);
 
-  const sendMessage = async (event?: FormEvent<HTMLFormElement>) => {
+  const sendMessage = async (
+    event?: FormEvent<HTMLFormElement>,
+    action: "auto" | "steer" = "auto",
+  ) => {
     event?.preventDefault();
     if (selectedThread?.canAcceptDirectInput === false) {
       setNotice({
@@ -1463,6 +1573,7 @@ export default function App() {
     }
     if (
       sending ||
+      queueingRef.current ||
       compressingUploadsRef.current ||
       (!composer.trim() && uploads.length === 0) ||
       !client ||
@@ -1476,17 +1587,67 @@ export default function App() {
       });
       return;
     }
+    const hasActiveTurn = turnActive || Boolean(activeTurnId);
+    const shouldSteer = action === "steer" || hasActiveTurn;
+    if (shouldSteer && (!selectedThread || !turnActive || !activeTurnId)) {
+      setNotice({
+        tone: "info",
+        text: "Wait for the active turn details before sending a direction.",
+      });
+      return;
+    }
     setSending(true);
     setNotice(null);
     const selectionAtSend = selectedRef.current;
     const loadVersionAtSend = loadVersionRef.current;
     let threadId = selectedThread?.id;
+    const threadIdAtSend = threadId ?? null;
+    const turnIdAtSend = activeTurnId;
     try {
-      const input: UserInput[] = [];
-      if (composer.trim())
-        input.push({ type: "text", text: composer.trim(), text_elements: [] });
-      for (const upload of uploads)
-        input.push({ type: "image", url: upload.dataUrl, detail: "auto" });
+      const input = userInputFromDraft(composer, uploads);
+
+      if (shouldSteer) {
+        const attemptKey = JSON.stringify([
+          threadIdAtSend,
+          turnIdAtSend,
+          composer,
+          uploads.map((upload) => upload.id),
+        ]);
+        const clientUserMessageId =
+          steerAttemptRef.current?.key === attemptKey
+            ? steerAttemptRef.current.clientUserMessageId
+            : crypto.randomUUID();
+        steerAttemptRef.current = { key: attemptKey, clientUserMessageId };
+        const steerParams = {
+          threadId: threadIdAtSend!,
+          expectedTurnId: turnIdAtSend!,
+          clientUserMessageId,
+          input,
+        };
+        const requestBytes = serializedRequestBytes("turn/steer", steerParams);
+        if (requestBytes > maxTurnRequestBytes) {
+          setNotice({
+            tone: "error",
+            text: `This direction is too large for Codex (${Math.ceil(requestBytes / 1024)} KB; limit ${Math.floor(maxTurnRequestBytes / 1024)} KB). Remove an image or shorten the text.`,
+          });
+          return;
+        }
+        await client.request<{ turnId: string }>("turn/steer", steerParams);
+        if (
+          selectedRef.current === threadIdAtSend &&
+          loadVersionRef.current === loadVersionAtSend
+        ) {
+          setComposer("");
+          if (composerRef.current) composerRef.current.style.height = "39px";
+          setUploads([]);
+          steerAttemptRef.current = null;
+        }
+        setNotice({
+          tone: "success",
+          text: "Direction sent to the active turn.",
+        });
+        return;
+      }
 
       const turnParams: Record<string, unknown> = {
         threadId: threadId ?? "00000000-0000-0000-0000-000000000000",
@@ -1602,10 +1763,95 @@ export default function App() {
     } catch (error) {
       setNotice({
         tone: "error",
-        text: `Could not confirm that Codex started the turn. Check the conversation before retrying. ${shortError(error)}`,
+        text: shouldSteer
+          ? `Could not confirm that the direction was sent. Check the conversation before retrying. ${shortError(error)}`
+          : `Could not confirm that Codex started the turn. Check the conversation before retrying. ${shortError(error)}`,
       });
     } finally {
       setSending(false);
+    }
+  };
+
+  const queueMessage = async () => {
+    if (queueingRef.current || sending || compressingUploadsRef.current) return;
+    if (selectedThread?.canAcceptDirectInput === false) return;
+    if (
+      !client ||
+      connection !== "online" ||
+      loadingThread ||
+      selectedRef.current !== (selectedThread?.id ?? null)
+    )
+      return;
+    if (!selectedThread || !turnActive || !activeTurnId) {
+      setNotice({
+        tone: "info",
+        text: "Wait for the active turn details before queueing a reply.",
+      });
+      return;
+    }
+    if (!composer.trim() && uploads.length === 0) return;
+
+    const threadIdAtQueue = selectedThread.id;
+    const threadTitleAtQueue = titleFor(selectedThread);
+    const loadVersionAtQueue = loadVersionRef.current;
+    const textAtQueue = composer;
+    const uploadsAtQueue = [...uploads];
+    const input = userInputFromDraft(textAtQueue, uploadsAtQueue);
+    const attemptKey = JSON.stringify([
+      threadIdAtQueue,
+      textAtQueue,
+      uploadsAtQueue.map((upload) => upload.id),
+    ]);
+    const clientUserMessageId =
+      queueAttemptRef.current?.key === attemptKey
+        ? queueAttemptRef.current.clientUserMessageId
+        : crypto.randomUUID();
+    queueAttemptRef.current = { key: attemptKey, clientUserMessageId };
+    const params = { threadId: threadIdAtQueue, input, clientUserMessageId };
+    const requestBytes = serializedRequestBytes("thread/queue/add", params);
+    if (requestBytes > maxTurnRequestBytes) {
+      setNotice({
+        tone: "error",
+        text: `This queued reply is too large for Codex (${Math.ceil(requestBytes / 1024)} KB; limit ${Math.floor(maxTurnRequestBytes / 1024)} KB). Remove an image or shorten the text.`,
+      });
+      return;
+    }
+
+    queueingRef.current = true;
+    setQueueing(true);
+    setNotice(null);
+    try {
+      const result = await client.request<{
+        queuedSubmission: { id: string };
+      }>("thread/queue/add", params);
+      if (!result.queuedSubmission?.id)
+        throw new Error("The daemon did not confirm the queued reply.");
+      let clearedDraft = false;
+      if (
+        selectedRef.current === threadIdAtQueue &&
+        loadVersionRef.current === loadVersionAtQueue &&
+        composer === textAtQueue &&
+        uploads.map((upload) => upload.id).join("\u0000") ===
+          uploadsAtQueue.map((upload) => upload.id).join("\u0000")
+      ) {
+        setComposer("");
+        if (composerRef.current) composerRef.current.style.height = "39px";
+        setUploads([]);
+        clearedDraft = true;
+      }
+      if (clearedDraft) queueAttemptRef.current = null;
+      setNotice({
+        tone: "success",
+        text: `Reply queued for ${threadTitleAtQueue}. It will run after the active turn.`,
+      });
+    } catch (error) {
+      setNotice({
+        tone: "error",
+        text: `Could not confirm that the reply was queued. Check the thread queue before retrying. ${shortError(error)}`,
+      });
+    } finally {
+      queueingRef.current = false;
+      setQueueing(false);
     }
   };
 
@@ -1613,6 +1859,11 @@ export default function App() {
     if (
       !client ||
       !selectedThread ||
+      connection !== "online" ||
+      loadingThread ||
+      sending ||
+      queueingRef.current ||
+      selectedRef.current !== selectedThread.id ||
       selectedThread.canAcceptDirectInput === false ||
       !activeTurnId ||
       interrupting
@@ -1632,6 +1883,12 @@ export default function App() {
     } finally {
       setInterrupting(false);
     }
+  };
+
+  const preserveComposerFocusOnPointerDown = (
+    event: ReactPointerEvent<HTMLButtonElement>,
+  ) => {
+    if (document.activeElement === composerRef.current) event.preventDefault();
   };
 
   const archiveThread = async (thread: ThreadSummary) => {
@@ -1794,14 +2051,26 @@ export default function App() {
     ? titleFor(selectedThread)
     : "New conversation";
   const currentConnection = status.daemon.available ? connection : "offline";
-  const canSubmit =
+  const hasComposerContent = Boolean(composer.trim() || uploads.length);
+  const hasActiveTurn = turnActive || Boolean(activeTurnId);
+  const canCompose =
     connection === "online" &&
     !sending &&
+    !queueing &&
     selectedThread?.canAcceptDirectInput !== false &&
     !loadingThread &&
     !compressingUploads &&
     selectedRef.current === (selectedThread?.id ?? null) &&
-    Boolean(composer.trim() || uploads.length);
+    hasComposerContent;
+  const canSubmit = canCompose && !hasActiveTurn;
+  const canSteerOrQueue =
+    connection === "online" &&
+    selectedThread?.canAcceptDirectInput !== false &&
+    !loadingThread &&
+    !compressingUploads &&
+    selectedRef.current === (selectedThread?.id ?? null) &&
+    hasComposerContent &&
+    Boolean(selectedThread && turnActive && activeTurnId);
 
   return (
     <div className={`app-shell ${sidebarCollapsed ? "sidebar-collapsed" : ""}`}>
@@ -2247,10 +2516,11 @@ export default function App() {
                 if (
                   event.key === "Enter" &&
                   !event.shiftKey &&
-                  !event.nativeEvent.isComposing
+                  !event.nativeEvent.isComposing &&
+                  event.nativeEvent.keyCode !== 229
                 ) {
                   event.preventDefault();
-                  void sendMessage();
+                  void sendMessage(undefined, hasActiveTurn ? "steer" : "auto");
                 }
               }}
               placeholder={
@@ -2261,9 +2531,10 @@ export default function App() {
               rows={1}
               disabled={
                 connection !== "online" ||
-                sending ||
                 selectedThread?.canAcceptDirectInput === false
               }
+              readOnly={sending || queueing}
+              aria-busy={sending || queueing}
             />
             <div className="composer-toolbar">
               <div className="composer-tools">
@@ -2280,6 +2551,7 @@ export default function App() {
                     disabled={
                       compressingUploads ||
                       sending ||
+                      queueing ||
                       selectedThread?.canAcceptDirectInput === false
                     }
                     onChange={(event) => {
@@ -2293,7 +2565,11 @@ export default function App() {
                   className={`composer-tool ${showSettings ? "active" : ""}`}
                   title="Model and permission options"
                   aria-expanded={showSettings}
-                  disabled={selectedThread?.canAcceptDirectInput === false}
+                  disabled={
+                    sending ||
+                    queueing ||
+                    selectedThread?.canAcceptDirectInput === false
+                  }
                   onClick={() => setShowSettings((value) => !value)}
                 >
                   <Shield size={16} />
@@ -2303,25 +2579,67 @@ export default function App() {
               </div>
               <div className="composer-right">
                 <span className="composer-hint">
-                  Enter to send · Shift + Enter for a new line
+                  {hasActiveTurn
+                    ? "Enter to steer · Shift + Enter for a new line"
+                    : "Enter to send · Shift + Enter for a new line"}
                 </span>
-                {turnActive && activeTurnId ? (
-                  <button
-                    type="button"
-                    className="send-button stop-button"
-                    onClick={() => void interruptTurn()}
-                    disabled={
-                      interrupting ||
-                      selectedThread?.canAcceptDirectInput === false
-                    }
-                    aria-label="Interrupt turn"
-                  >
-                    {interrupting ? (
-                      <LoaderCircle className="spin" size={16} />
-                    ) : (
-                      <Square size={13} fill="currentColor" />
-                    )}
-                  </button>
+                {hasActiveTurn ? (
+                  <>
+                    {hasComposerContent ? (
+                      <div className="composer-active-actions">
+                        <button
+                          type="button"
+                          className="composer-action queue-action"
+                          onClick={() => void queueMessage()}
+                          onPointerDown={preserveComposerFocusOnPointerDown}
+                          disabled={!canSteerOrQueue}
+                          aria-disabled={sending || queueing}
+                          title="Add this reply to the daemon's thread queue"
+                        >
+                          {queueing ? (
+                            <LoaderCircle className="spin" size={13} />
+                          ) : null}
+                          Queue
+                        </button>
+                        <button
+                          type="button"
+                          className="composer-action steer-action"
+                          onClick={() => void sendMessage(undefined, "steer")}
+                          onPointerDown={preserveComposerFocusOnPointerDown}
+                          disabled={!canSteerOrQueue}
+                          aria-disabled={sending || queueing}
+                        >
+                          {sending ? (
+                            <LoaderCircle className="spin" size={13} />
+                          ) : null}
+                          Steer
+                        </button>
+                      </div>
+                    ) : null}
+                    <button
+                      type="button"
+                      className="send-button stop-button"
+                      onClick={() => void interruptTurn()}
+                      disabled={
+                        interrupting ||
+                        !activeTurnId ||
+                        connection !== "online" ||
+                        loadingThread ||
+                        sending ||
+                        queueing ||
+                        selectedRef.current !== (selectedThread?.id ?? null) ||
+                        selectedThread?.canAcceptDirectInput === false
+                      }
+                      aria-label="Interrupt turn"
+                      title="Stop turn"
+                    >
+                      {interrupting ? (
+                        <LoaderCircle className="spin" size={16} />
+                      ) : (
+                        <Square size={13} fill="currentColor" />
+                      )}
+                    </button>
+                  </>
                 ) : (
                   <button
                     type="submit"
@@ -2448,10 +2766,6 @@ export default function App() {
               </div>
             ) : null}
           </form>
-          <p className="composer-footnote">
-            Codex can make mistakes. Review commands and file changes before
-            accepting them.
-          </p>
         </div>
       </main>
 
@@ -2646,69 +2960,84 @@ function TimelineCard({
   if (item.type === "commandExecution") {
     const command = asString(item.command);
     const output = asString(item.aggregatedOutput);
+    const commandLines = command.split(/\r\n|\r|\n/);
+    const commandNeedsExpansion =
+      command.length > 180 ||
+      commandLines.length > 3 ||
+      commandLines.some((line) => line.length > 44);
+    const outputLines = output.split(/\r\n|\r|\n/);
+    if (/(?:\r\n|\r|\n)$/.test(output)) outputLines.pop();
+    const previewLines = outputLines.slice(0, 3);
+    const remainingLines = outputLines.slice(3);
     const status = activityStatus(
       item.status ?? (entry.streaming ? "inProgress" : undefined),
     );
-    if (!command.trim() && !output.trim()) {
-      if (entry.streaming)
-        return (
-          <div className="activity-card activity-progress">
-            <span className="activity-icon command">
-              <Terminal size={14} />
-            </span>
-            <span className="activity-title">Running command</span>
-            <span className="activity-status running">Running</span>
-          </div>
-        );
-      if (["failed", "interrupted"].includes(status.className))
-        return (
-          <div className="activity-card activity-progress">
-            <span className="activity-icon command">
-              <Terminal size={14} />
-            </span>
-            <span className="activity-title">Command</span>
-            <span className={`activity-status ${status.className}`}>
-              {status.label}
-            </span>
-          </div>
-        );
-      return null;
-    }
     return (
-      <details className="activity-card">
-        <summary>
+      <div className="activity-card command-activity">
+        <div className="command-activity-heading">
           <span className="activity-icon command">
             <Terminal size={14} />
           </span>
-          <span className="activity-title">Ran command</span>
+          <span className="activity-title">
+            {command.trim()
+              ? entry.streaming
+                ? "Running command"
+                : "Command"
+              : entry.streaming
+                ? "Running command"
+                : "Command details unavailable"}
+          </span>
           <span className={`activity-status ${status.className}`}>
             {status.label}
           </span>
-          <ChevronDown className="activity-chevron" size={15} />
-        </summary>
-        <div className="activity-body">
-          <div className="code-heading">
-            <span>COMMAND</span>
-            <span>{asString(item.cwd)}</span>
-          </div>
-          <pre>
-            <code>{asString(item.command)}</code>
-          </pre>
-          {asString(item.aggregatedOutput) ? (
-            <>
-              <div className="code-heading">
-                <span>OUTPUT</span>
-                {typeof item.exitCode === "number" ? (
-                  <span>exit {item.exitCode}</span>
-                ) : null}
-              </div>
-              <pre>
-                <code>{asString(item.aggregatedOutput)}</code>
-              </pre>
-            </>
-          ) : null}
         </div>
-      </details>
+        {command.trim() ? (
+          <div className="command-activity-body">
+            <pre className="command-preview">
+              <code>{command}</code>
+            </pre>
+            {commandNeedsExpansion ? (
+              <details className="command-full">
+                <summary>Show full command</summary>
+                <pre>
+                  <code>{command}</code>
+                </pre>
+              </details>
+            ) : null}
+            {asString(item.cwd) ? (
+              <div className="command-cwd">{asString(item.cwd)}</div>
+            ) : null}
+          </div>
+        ) : null}
+        {output.trim() ? (
+          <div className="command-output">
+            <div className="command-output-heading">
+              <span>OUTPUT</span>
+              {typeof item.exitCode === "number" ? (
+                <span>exit {item.exitCode}</span>
+              ) : null}
+            </div>
+            <pre className="command-output-preview">
+              <code>{previewLines.join("\n")}</code>
+            </pre>
+            {remainingLines.length ? (
+              <details className="command-output-more">
+                <summary>
+                  + {remainingLines.length} more{" "}
+                  {remainingLines.length === 1 ? "line" : "lines"}
+                </summary>
+                <pre>
+                  <code>{remainingLines.join("\n")}</code>
+                </pre>
+              </details>
+            ) : null}
+          </div>
+        ) : !command.trim() && !entry.streaming ? (
+          <div className="command-details-unavailable">
+            Command and output were not included in this activity item.
+          </div>
+        ) : null}
+      </div>
     );
   }
   if (item.type === "fileChange") {
