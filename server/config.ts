@@ -160,6 +160,7 @@ export const config = {
   allowedOrigins,
   endpoint: resolveDaemonEndpoint(),
   tokenPath,
+  sessionStatePath: resolve(join(dirname(tokenPath), "session-state.json")),
   pushStatePath: resolve(
     process.env.CODEX_WEB_PUSH_STATE_FILE ||
       join(dirname(tokenPath), "push-state.json"),
@@ -169,5 +170,6 @@ export const config = {
   maxPayloadBytes: 1024 * 1024,
   connectTimeoutMs: 5000,
   initializeTimeoutMs: 10000,
-  sessionMaxAgeMs: 12 * 60 * 60 * 1000,
+  sessionMaxAgeMs: 180 * 24 * 60 * 60 * 1000,
+  sessionRenewalWindowMs: 30 * 24 * 60 * 60 * 1000,
 };

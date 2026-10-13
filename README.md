@@ -114,11 +114,13 @@ The proxy must forward HTTP WebSocket upgrades to `/api/rpc`. The bridge validat
 
 ## API and protocol notes
 
-- `POST /api/login` accepts `{ "token": "..." }`, sets an `HttpOnly`, `SameSite=Strict` session cookie, and returns status.
+- `POST /api/login` accepts `{ "token": "..." }`, sets an `HttpOnly`, `SameSite=Strict` session cookie for 180 days, and returns status. Session records persist beside the access-token file, so browser logins survive server restarts. Authenticated HTTP requests renew the session and cookie when fewer than 30 days remain. The persisted file contains session ID hashes, expiry times, and an access-token fingerprint; rotating the access token invalidates existing sessions.
 - `GET /api/status` requires that cookie and returns `{ "authenticated": true, "daemon": { "available": boolean, "error?": string, "endpoint": string } }`.
 - `POST /api/logout` clears the session cookie and immediately closes that login session's active browser connections.
 - `GET /api/push/config`, `POST /api/push/subscription`, and `DELETE /api/push/subscription` require an authenticated session. The config response reports server readiness and its VAPID key; subscription routes persist each explicitly enabled browser.
 - Authenticated WebSocket clients connect to `/api/rpc`. After the backend initializes the upstream app-server, it sends `{ "method": "bridge/ready", "params": {} }`. Bridge-local failures use `{ "method": "bridge/error", "params": { "message": "..." } }`.
+
+After upgrading from a version that kept sessions only in memory, sign in once again. Existing cookies cannot be migrated because their session records were not persisted.
 
 The service worker displays a generic “Codex needs your input” notification and opens the encoded thread route when clicked. The push payload does not include question text. The bridge observes `item/tool/requestUserInput` requests on the existing browser connection and forwards them unchanged. The app-server protocol exposes these requests on the connection handling a thread; there is no global request event source, so notifications are sent only while a browser bridge is connected. Push cannot detect a question that arrives while the browser app is closed.
 

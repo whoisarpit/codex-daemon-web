@@ -187,6 +187,27 @@ async function savePushSubscription(
     throw new Error("Could not save this device’s notification settings.");
 }
 
+function appAssetSignature(source: Document): string[] {
+  const baseUrl = source.querySelector("base[href]")?.getAttribute("href");
+  const base = baseUrl
+    ? new URL(baseUrl, window.location.href)
+    : window.location;
+  return Array.from(
+    source.querySelectorAll<HTMLElement>(
+      'script[type="module"][src], link[rel="stylesheet"][href], link[rel="modulepreload"][href]',
+    ),
+  )
+    .flatMap((element) => {
+      const assetPath =
+        element.getAttribute("src") ?? element.getAttribute("href");
+      if (!assetPath) return [];
+      const assetUrl = new URL(assetPath, base.href);
+      if (assetUrl.origin !== window.location.origin) return [];
+      return [`${element.tagName.toLowerCase()}:${assetUrl.pathname}`];
+    })
+    .sort();
+}
+
 function routeHash(route: ConversationRoute): string {
   return route.kind === "new"
     ? "#/new"
@@ -670,6 +691,7 @@ export default function App() {
   const [approvalPolicy, setApprovalPolicy] = useState("");
   const [sandboxMode, setSandboxMode] = useState("");
   const [showSettings, setShowSettings] = useState(false);
+  const [newVersionAvailable, setNewVersionAvailable] = useState(false);
   const [completionSoundEnabled, setCompletionSoundEnabled] = useState(
     readCompletionSoundPreference,
   );
@@ -742,6 +764,7 @@ export default function App() {
   const sessionProbeInFlightRef = useRef<number | null>(null);
   const sessionProbeLastAtRef = useRef(0);
   const approvalPrompt = approvalQueue[0] ?? null;
+  const updateCheckRef = useRef<(() => void) | null>(null);
   const newConversationRef = useRef<
     (historyMode?: "push" | "replace" | "none") => void
   >(() => {});
@@ -1086,6 +1109,70 @@ export default function App() {
   useEffect(() => {
     void refreshStatus();
   }, [refreshStatus]);
+
+  useEffect(() => {
+    const loadedAssets = appAssetSignature(document);
+    if (!loadedAssets.length) return;
+    let cancelled = false;
+    let checking = false;
+    const checkForUpdate = async () => {
+      if (cancelled || checking || document.visibilityState !== "visible")
+        return;
+      checking = true;
+      if ("serviceWorker" in navigator) {
+        void navigator.serviceWorker
+          .getRegistration()
+          .then((registration) => registration?.update())
+          .catch(() => {});
+      }
+      try {
+        const response = await fetch("/", {
+          cache: "no-store",
+          credentials: "same-origin",
+        });
+        if (!response.ok) return;
+        const html = await response.text();
+        if (cancelled) return;
+        const latestDocument = new DOMParser().parseFromString(
+          html,
+          "text/html",
+        );
+        const latestAssets = appAssetSignature(latestDocument);
+        if (
+          latestAssets.length &&
+          (latestAssets.length !== loadedAssets.length ||
+            latestAssets.some((asset, index) => asset !== loadedAssets[index]))
+        )
+          setNewVersionAvailable(true);
+      } catch {
+      } finally {
+        checking = false;
+      }
+    };
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === "visible") void checkForUpdate();
+    };
+    const handleOnline = () => void checkForUpdate();
+    updateCheckRef.current = () => void checkForUpdate();
+    void checkForUpdate();
+    const interval = window.setInterval(
+      () => void checkForUpdate(),
+      5 * 60 * 1000,
+    );
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    window.addEventListener("online", handleOnline);
+    return () => {
+      cancelled = true;
+      updateCheckRef.current = null;
+      window.clearInterval(interval);
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+      window.removeEventListener("online", handleOnline);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (connection === "online") updateCheckRef.current?.();
+  }, [connection]);
 
   const refreshThreads = useCallback(
     async (rpc: RpcClient, archived = archivedThreads, append = false) => {
@@ -2926,6 +3013,28 @@ export default function App() {
             </button>
           </div>
         )}
+
+        {newVersionAvailable ? (
+          <div className="update-banner" role="status">
+            <div className="update-banner-copy">
+              <strong>New version available.</strong>
+              {composer.trim() || uploads.length || compressingUploads ? (
+                <span>
+                  Refreshing will discard your unsent message and attachments.
+                </span>
+              ) : (
+                <span>Refresh to use the latest version.</span>
+              )}
+            </div>
+            <button
+              type="button"
+              aria-label="Refresh to use the new version"
+              onClick={() => window.location.reload()}
+            >
+              Refresh
+            </button>
+          </div>
+        ) : null}
 
         {connectionMessage &&
         connection !== "online" &&

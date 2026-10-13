@@ -10,6 +10,7 @@ import {
   login,
   logout,
   prepareAuthentication,
+  renewSessionCookie,
 } from "./auth.js";
 import { config } from "./config.js";
 import { daemonAvailable, endpointLabel } from "./daemon.js";
@@ -38,12 +39,17 @@ function requireBrowserOrigin(
   next();
 }
 
-function requireSession(
+async function requireSession(
   request: express.Request,
   response: express.Response,
   next: express.NextFunction,
-): void {
-  if (!authenticatedSession(request)) {
+): Promise<void> {
+  const session = authenticatedSession(request);
+  if (!session) {
+    response.status(401).json({ authenticated: false });
+    return;
+  }
+  if (!(await renewSessionCookie(session, response))) {
     response.status(401).json({ authenticated: false });
     return;
   }
@@ -140,7 +146,7 @@ app.post(
   "/api/logout",
   requireBrowserOrigin,
   requireSession,
-  (request, response) => logout(request, response),
+  async (request, response) => logout(request, response),
 );
 
 app.use("/api", (_request, response) =>
@@ -165,6 +171,7 @@ if (process.env.NODE_ENV !== "development") {
       }),
     );
     app.get("/{*path}", (_request, response, next) => {
+      response.setHeader("Cache-Control", "no-store");
       response.sendFile(entryFile, (error) => {
         if (error) next(error);
       });
