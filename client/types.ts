@@ -38,11 +38,19 @@ export type DaemonStatus = {
 
 export type UserInput =
   | { type: "text"; text: string; text_elements: Array<unknown> }
-  | {
+  | ({
       type: "image";
-      url: string;
       detail?: "auto" | "low" | "high" | "original";
-    };
+    } & ({ url: string } | { fileId: string }))
+  | {
+      type: "localImage";
+      path: string;
+      detail?: "auto" | "low" | "high" | "original";
+    }
+  | { type: "audio"; url: string }
+  | { type: "localAudio"; path: string }
+  | { type: "skill"; name: string; path: string }
+  | { type: "mention"; name: string; path: string };
 
 export type ThreadItem = {
   type: string;
@@ -122,6 +130,12 @@ export type ThreadTokenUsage = {
     reasoningOutputTokens: number;
   };
   modelContextWindow: number | null;
+};
+
+export type QueuedSubmission = {
+  id: string;
+  input: UserInput[];
+  clientUserMessageId: string;
 };
 
 export type ApprovalPrompt = {

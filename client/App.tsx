@@ -41,6 +41,7 @@ import type {
   ApprovalPrompt,
   DaemonStatus,
   ModelOption,
+  QueuedSubmission,
   RpcError,
   ThreadDetails,
   ThreadItem,
@@ -382,6 +383,164 @@ function ContextUsageIndicator({ usage }: { usage: ThreadTokenUsage | null }) {
   );
 }
 
+function QueuedMessageCard({
+  submission,
+  position,
+  total,
+}: {
+  submission: QueuedSubmission;
+  position: number;
+  total: number;
+}) {
+  const text = submission.input
+    .filter((part) => isRecord(part) && part.type === "text")
+    .map((part) => (isRecord(part) ? asString(part.text).trim() : ""))
+    .filter(Boolean)
+    .join(" ");
+  const imageParts = submission.input.filter(
+    (part) => isRecord(part) && part.type === "image",
+  );
+  const otherAttachments = submission.input.filter(
+    (part) => isRecord(part) && part.type !== "text" && part.type !== "image",
+  );
+  const imagePreviews = imageParts
+    .slice(0, 3)
+    .map((part) => ("url" in part ? safeImageUrl(part.url) : null));
+
+  return (
+    <article className="queued-message-card">
+      <div className="queued-message-order">
+        {position === 0 ? "Next up" : `${position + 1} of ${total}`}
+      </div>
+      <div className="queued-message-content">
+        {text ? <p>{text}</p> : null}
+        {imageParts.length ? (
+          <div className="queued-message-attachments">
+            {imagePreviews.map((url, index) =>
+              url ? (
+                <img
+                  className="queued-message-image"
+                  key={`${submission.id}-image-${index}`}
+                  src={url}
+                  alt="Queued image attachment"
+                />
+              ) : (
+                <span
+                  className="queued-message-attachment"
+                  key={`${submission.id}-image-${index}`}
+                >
+                  Image attachment
+                </span>
+              ),
+            )}
+            {imageParts.length > imagePreviews.length ? (
+              <span className="queued-message-attachment">
+                +{imageParts.length - imagePreviews.length} images
+              </span>
+            ) : null}
+          </div>
+        ) : null}
+        {otherAttachments.length ? (
+          <div className="queued-message-attachments">
+            {otherAttachments.map((part, index) => (
+              <span
+                className="queued-message-attachment"
+                key={`${submission.id}-attachment-${index}`}
+              >
+                {isRecord(part) && part.type === "localImage"
+                  ? "Image attachment"
+                  : isRecord(part) &&
+                      (part.type === "audio" || part.type === "localAudio")
+                    ? "Audio attachment"
+                    : isRecord(part) && part.type === "skill"
+                      ? `Skill · ${asString(part.name)}`
+                      : isRecord(part) && part.type === "mention"
+                        ? `Mention · ${asString(part.name)}`
+                        : "Attachment"}
+              </span>
+            ))}
+          </div>
+        ) : null}
+        {!text && !imageParts.length && !otherAttachments.length ? (
+          <p>Queued message</p>
+        ) : null}
+      </div>
+    </article>
+  );
+}
+
+function QueuedMessageStack({
+  submissions,
+  expanded,
+  onToggle,
+  onRetry,
+  loading,
+  error,
+}: {
+  submissions: QueuedSubmission[];
+  expanded: boolean;
+  onToggle: () => void;
+  onRetry: () => void;
+  loading: boolean;
+  error: string;
+}) {
+  if (loading && !submissions.length)
+    return (
+      <div className="queued-message-state" role="status">
+        Checking queued messages…
+      </div>
+    );
+  if (error && !submissions.length)
+    return (
+      <div className="queued-message-state error" role="status">
+        <span>Queued messages could not be loaded.</span>
+        <button type="button" onClick={onRetry}>
+          Try again
+        </button>
+      </div>
+    );
+  if (!submissions.length) return null;
+
+  const visibleSubmissions = expanded ? submissions : submissions.slice(0, 1);
+  const stacked = !expanded && submissions.length > 1;
+
+  return (
+    <section
+      className="queued-message-stack"
+      aria-label={`${submissions.length} queued messages`}
+    >
+      <div className="queued-message-heading">
+        <div>
+          <span>Queued</span>
+          <span className="queued-message-count">{submissions.length}</span>
+        </div>
+        {submissions.length > 1 ? (
+          <button type="button" aria-expanded={expanded} onClick={onToggle}>
+            {expanded ? "Show less" : `Show ${submissions.length - 1} more`}
+          </button>
+        ) : null}
+      </div>
+      <div
+        className={`queued-message-cards ${stacked ? "stacked" : ""} ${expanded ? "expanded" : ""}`}
+      >
+        {visibleSubmissions.map((submission, position) => (
+          <QueuedMessageCard
+            key={submission.id}
+            submission={submission}
+            position={position}
+            total={submissions.length}
+          />
+        ))}
+      </div>
+      {error ? (
+        <div className="queued-message-refresh-error" role="status">
+          The queue may be out of date.
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
 function userInputFromDraft(
   text: string,
   uploads: PendingUpload[],
@@ -698,6 +857,13 @@ export default function App() {
   const [selectedThread, setSelectedThread] = useState<ThreadSummary | null>(
     null,
   );
+  const [queuedSubmissions, setQueuedSubmissions] = useState<
+    QueuedSubmission[]
+  >([]);
+  const [queueThreadId, setQueueThreadId] = useState<string | null>(null);
+  const [queueLoading, setQueueLoading] = useState(false);
+  const [queueError, setQueueError] = useState("");
+  const [queueExpanded, setQueueExpanded] = useState(false);
   const [threadDetails, setThreadDetails] = useState<ThreadDetails | null>(
     null,
   );
@@ -834,6 +1000,7 @@ export default function App() {
   const composerRef = useRef<HTMLTextAreaElement>(null);
   const scrollWasNearBottom = useRef(true);
   const loadVersionRef = useRef(0);
+  const queueLoadVersionRef = useRef(0);
   const threadNavigationRef = useRef(false);
   const sessionExpiredRef = useRef(false);
   const sessionProbeEpochRef = useRef(0);
@@ -1041,6 +1208,12 @@ export default function App() {
       setApprovalQueue([]);
       setQuestionAnswers({});
       setThreadTokenUsage(null);
+      queueLoadVersionRef.current += 1;
+      setQueueThreadId(null);
+      setQueuedSubmissions([]);
+      setQueueLoading(false);
+      setQueueError("");
+      setQueueExpanded(false);
     }
   }, [connection]);
   const unknownRequest = Boolean(
@@ -1117,6 +1290,12 @@ export default function App() {
     detach();
     selectedRef.current = null;
     setThreadTokenUsage(null);
+    queueLoadVersionRef.current += 1;
+    setQueueThreadId(null);
+    setQueuedSubmissions([]);
+    setQueueLoading(false);
+    setQueueError("");
+    setQueueExpanded(false);
     const newRoute: ConversationRoute = { kind: "new" };
     routeRef.current = newRoute;
     setRoute(newRoute);
@@ -1316,6 +1495,57 @@ export default function App() {
     [model],
   );
 
+  const refreshThreadQueue = useCallback(
+    async (rpc: RpcClient, threadId: string) => {
+      const version = ++queueLoadVersionRef.current;
+      const submissions: QueuedSubmission[] = [];
+      let cursor: string | null = null;
+      try {
+        do {
+          const page: {
+            data: QueuedSubmission[];
+            nextCursor: string | null;
+          } = await rpc.request("thread/queue/list", {
+            threadId,
+            limit: 100,
+            ...(cursor ? { cursor } : {}),
+          });
+          submissions.push(...page.data);
+          if (!page.nextCursor || page.nextCursor === cursor) break;
+          cursor = page.nextCursor;
+        } while (true);
+        if (
+          version !== queueLoadVersionRef.current ||
+          selectedRef.current !== threadId
+        )
+          return;
+        const uniqueSubmissions = [
+          ...new Map(
+            submissions.map((submission) => [submission.id, submission]),
+          ).values(),
+        ];
+        setQueueThreadId(threadId);
+        setQueuedSubmissions(uniqueSubmissions);
+        setQueueError("");
+      } catch (error) {
+        if (
+          version !== queueLoadVersionRef.current ||
+          selectedRef.current !== threadId
+        )
+          return;
+        setQueueThreadId(threadId);
+        setQueueError(shortError(error));
+      } finally {
+        if (
+          version === queueLoadVersionRef.current &&
+          selectedRef.current === threadId
+        )
+          setQueueLoading(false);
+      }
+    },
+    [],
+  );
+
   const handleNotification = useCallback(
     (method: string, params: Record<string, unknown>) => {
       if (method === "error") {
@@ -1355,6 +1585,13 @@ export default function App() {
         setApprovalQueue((current) =>
           current.filter((prompt) => prompt.id !== params.requestId),
         );
+        return;
+      }
+
+      if (method === "thread/queue/changed") {
+        const threadId = asString(params.threadId);
+        if (threadId && threadId === selectedRef.current && client)
+          void refreshThreadQueue(client, threadId);
         return;
       }
 
@@ -1546,7 +1783,7 @@ export default function App() {
         return;
       }
     },
-    [activeTurnId, archivedThreads, client, refreshThreads],
+    [activeTurnId, archivedThreads, client, refreshThreadQueue, refreshThreads],
   );
 
   const handleServerRequest = useCallback((request: ApprovalPrompt) => {
@@ -1572,6 +1809,12 @@ export default function App() {
         threadsRef.current.find((thread) => thread.id === threadId) ?? null;
       setSelectedThread(summary);
       setThreadTokenUsage(null);
+      queueLoadVersionRef.current += 1;
+      setQueueThreadId(threadId);
+      setQueuedSubmissions([]);
+      setQueueLoading(true);
+      setQueueError("");
+      setQueueExpanded(false);
       setItems([]);
       setThreadDetails(null);
       setLoadingThread(true);
@@ -1596,6 +1839,7 @@ export default function App() {
         });
         if (version !== loadVersionRef.current) return;
         setThreadDetails(response);
+        void refreshThreadQueue(rpc, threadId);
         setCwd(response.cwd || summary?.cwd || "");
         setModel(response.model || summary?.model || "");
         setEffort(response.reasoningEffort || summary?.reasoningEffort || "");
@@ -1722,13 +1966,14 @@ export default function App() {
       } catch (error) {
         if (version !== loadVersionRef.current) return;
         setLoadingThread(false);
+        setQueueLoading(false);
         setNotice({
           tone: "error",
           text: `Could not open conversation: ${shortError(error)}`,
         });
       }
     },
-    [updateThreadTrail],
+    [refreshThreadQueue, updateThreadTrail],
   );
 
   const navigateToThread = useCallback(
@@ -1746,6 +1991,12 @@ export default function App() {
       updateThreadTrail(trail);
       selectedRef.current = threadId;
       setThreadTokenUsage(null);
+      queueLoadVersionRef.current += 1;
+      setQueueThreadId(null);
+      setQueuedSubmissions([]);
+      setQueueLoading(false);
+      setQueueError("");
+      setQueueExpanded(false);
       sessionStorage.setItem(selectedThreadKey, threadId);
       historyHandledRef.current = `${window.location.href}|${JSON.stringify(window.history.state)}`;
 
@@ -2061,6 +2312,12 @@ export default function App() {
       setThreads([]);
       setSelectedThread(null);
       setThreadTokenUsage(null);
+      queueLoadVersionRef.current += 1;
+      setQueueThreadId(null);
+      setQueuedSubmissions([]);
+      setQueueLoading(false);
+      setQueueError("");
+      setQueueExpanded(false);
       setThreadDetails(null);
       setItems([]);
       itemsRef.current = [];
@@ -2087,6 +2344,12 @@ export default function App() {
     threadNavigationRef.current = false;
     selectedRef.current = null;
     setThreadTokenUsage(null);
+    queueLoadVersionRef.current += 1;
+    setQueueThreadId(null);
+    setQueuedSubmissions([]);
+    setQueueLoading(false);
+    setQueueError("");
+    setQueueExpanded(false);
     sessionStorage.removeItem(selectedThreadKey);
     setSelectedThread(null);
     setThreadDetails(null);
@@ -2510,10 +2773,25 @@ export default function App() {
     setNotice(null);
     try {
       const result = await client.request<{
-        queuedSubmission: { id: string };
+        queuedSubmission: QueuedSubmission;
       }>("thread/queue/add", params);
       if (!result.queuedSubmission?.id)
         throw new Error("The daemon did not confirm the queued reply.");
+      if (
+        selectedRef.current === threadIdAtQueue &&
+        loadVersionRef.current === loadVersionAtQueue
+      ) {
+        setQueueThreadId(threadIdAtQueue);
+        setQueueError("");
+        setQueuedSubmissions((current) =>
+          current.some(
+            (submission) => submission.id === result.queuedSubmission.id,
+          )
+            ? current
+            : [...current, result.queuedSubmission],
+        );
+        void refreshThreadQueue(client, threadIdAtQueue);
+      }
       let clearedDraft = false;
       if (
         selectedRef.current === threadIdAtQueue &&
@@ -3280,6 +3558,22 @@ export default function App() {
         </div>
 
         <div className="composer-wrap">
+          {selectedThread && queueThreadId === selectedThread.id ? (
+            <QueuedMessageStack
+              submissions={queuedSubmissions}
+              expanded={queueExpanded}
+              onToggle={() => setQueueExpanded((current) => !current)}
+              onRetry={() => {
+                if (!client || selectedRef.current !== selectedThread.id)
+                  return;
+                setQueueLoading(true);
+                setQueueError("");
+                void refreshThreadQueue(client, selectedThread.id);
+              }}
+              loading={queueLoading}
+              error={queueError}
+            />
+          ) : null}
           <form className="composer-card" onSubmit={sendMessage}>
             {selectedThread?.canAcceptDirectInput === false ? (
               <div className="agent-read-only" role="status">
