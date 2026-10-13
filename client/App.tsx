@@ -52,11 +52,17 @@ import "./styles.css";
 
 type TimelineItem = ThreadItemEntry & { streaming?: boolean };
 type TimelineGroup =
-  | { kind: "message"; key: string; entry: TimelineItem }
+  | {
+      kind: "message";
+      key: string;
+      entry: TimelineItem;
+      responseKey: string | null;
+    }
   | {
       kind: "activity";
       key: string;
       responseKey: string;
+      defaultOwnerKey: string;
       entries: TimelineItem[];
     };
 type ThreadTrailEntry = { id: string; title: string };
@@ -2710,7 +2716,7 @@ export default function App() {
             const openKey = `${selectedRef.current ?? "new"}:${group.key}`;
             const isOpen =
               activityGroupOverrides[openKey] ??
-              group.responseKey === timelineGrouping.latestResponseKey;
+              group.defaultOwnerKey === timelineGrouping.latestMessageOwnerKey;
             return (
               <ResponseActivityGroup
                 key={group.key}
@@ -4257,20 +4263,19 @@ function mergeHistoryWithLive(
 
 function groupTimelineItems(items: TimelineItem[]): {
   groups: TimelineGroup[];
-  latestResponseKey: string | null;
+  latestMessageOwnerKey: string | null;
 } {
   const groups: TimelineGroup[] = [];
   let pendingActivity: TimelineItem[] = [];
   let pendingResponseKey: string | null = null;
   let currentResponseKey: string | null = null;
-  let latestResponseKey: string | null = null;
+  let currentUserResponseCanBindTurn = false;
   const responseKeysByTurn = new Map<string, string>();
   const responseKeyFor = (entry: TimelineItem) => {
-    if (!entry.turnId) return `user:${entry.item.id}`;
-    const knownResponseKey = responseKeysByTurn.get(entry.turnId);
-    if (knownResponseKey) return knownResponseKey;
-    const responseKey = `turn:${entry.turnId}`;
-    responseKeysByTurn.set(entry.turnId, responseKey);
+    const responseKey = entry.turnId
+      ? `turn:${entry.turnId}`
+      : `user:${entry.item.id}`;
+    if (entry.turnId) responseKeysByTurn.set(entry.turnId, responseKey);
     return responseKey;
   };
   const flushPendingActivity = () => {
@@ -4278,8 +4283,9 @@ function groupTimelineItems(items: TimelineItem[]): {
       const first = pendingActivity[0];
       groups.push({
         kind: "activity",
-        key: `activity:${pendingResponseKey}:${first.item.id}`,
+        key: `activity:${first.turnId || "no-turn"}:${first.item.id}`,
         responseKey: pendingResponseKey,
+        defaultOwnerKey: `pending:${pendingResponseKey}`,
         entries: pendingActivity,
       });
     }
@@ -4291,21 +4297,28 @@ function groupTimelineItems(items: TimelineItem[]): {
     if (entry.item.type === "userMessage") {
       flushPendingActivity();
       currentResponseKey = responseKeyFor(entry);
-      latestResponseKey = currentResponseKey;
+      currentUserResponseCanBindTurn = !entry.turnId;
       groups.push({
         kind: "message",
         key: `item:${entry.turnId}:${entry.item.id}`,
         entry,
+        responseKey: currentResponseKey,
       });
       continue;
     }
 
     if (entry.turnId) {
       const turnResponseKey = responseKeysByTurn.get(entry.turnId);
-      if (turnResponseKey) currentResponseKey = turnResponseKey;
-      else {
+      if (turnResponseKey) {
+        currentResponseKey = turnResponseKey;
+        currentUserResponseCanBindTurn = false;
+      } else if (currentUserResponseCanBindTurn && currentResponseKey) {
+        responseKeysByTurn.set(entry.turnId, currentResponseKey);
+        currentUserResponseCanBindTurn = false;
+      } else {
         currentResponseKey = `turn:${entry.turnId}`;
         responseKeysByTurn.set(entry.turnId, currentResponseKey);
+        currentUserResponseCanBindTurn = false;
       }
     }
 
@@ -4315,15 +4328,16 @@ function groupTimelineItems(items: TimelineItem[]): {
         kind: "message",
         key: `item:${entry.turnId}:${entry.item.id}`,
         entry,
+        responseKey: currentResponseKey,
       });
     } else if (entry.item.type === "agentMessage") {
       flushPendingActivity();
       currentResponseKey ??= `assistant:${entry.item.id}`;
-      latestResponseKey = currentResponseKey;
       groups.push({
         kind: "message",
         key: `item:${entry.turnId}:${entry.item.id}`,
         entry,
+        responseKey: currentResponseKey,
       });
     } else {
       if (!currentResponseKey) {
@@ -4332,6 +4346,7 @@ function groupTimelineItems(items: TimelineItem[]): {
           kind: "message",
           key: `item:${entry.turnId}:${entry.item.id}`,
           entry,
+          responseKey: null,
         });
         continue;
       }
@@ -4342,11 +4357,50 @@ function groupTimelineItems(items: TimelineItem[]): {
         flushPendingActivity();
       pendingResponseKey = currentResponseKey;
       pendingActivity.push(entry);
-      latestResponseKey = currentResponseKey;
     }
   }
   flushPendingActivity();
-  return { groups, latestResponseKey };
+
+  const latestAssistantByResponse = new Map<string, string>();
+  const pendingGroupIndexesByResponse = new Map<string, number[]>();
+  let latestMessageOwnerKey: string | null = null;
+  for (const [index, group] of groups.entries()) {
+    if (group.kind === "activity") {
+      const assistantOwner = latestAssistantByResponse.get(group.responseKey);
+      group.defaultOwnerKey = assistantOwner ?? `pending:${group.responseKey}`;
+      if (!assistantOwner) {
+        const pending =
+          pendingGroupIndexesByResponse.get(group.responseKey) ?? [];
+        pending.push(index);
+        pendingGroupIndexesByResponse.set(group.responseKey, pending);
+      }
+      latestMessageOwnerKey = group.defaultOwnerKey;
+      continue;
+    }
+
+    if (group.entry.item.type === "userMessage") {
+      if (group.responseKey)
+        latestMessageOwnerKey = `pending:${group.responseKey}`;
+      continue;
+    }
+
+    if (group.entry.item.type !== "agentMessage" || !group.responseKey)
+      continue;
+    const assistantOwner = `assistant:${group.responseKey}:${group.entry.item.id}`;
+    const pendingIndexes = pendingGroupIndexesByResponse.get(group.responseKey);
+    if (pendingIndexes) {
+      for (const pendingIndex of pendingIndexes) {
+        const pendingGroup = groups[pendingIndex];
+        if (pendingGroup.kind === "activity")
+          pendingGroup.defaultOwnerKey = assistantOwner;
+      }
+      pendingGroupIndexesByResponse.delete(group.responseKey);
+    }
+    latestAssistantByResponse.set(group.responseKey, assistantOwner);
+    latestMessageOwnerKey = assistantOwner;
+  }
+
+  return { groups, latestMessageOwnerKey };
 }
 
 function formatUnknown(value: unknown): string {
