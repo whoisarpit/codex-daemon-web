@@ -31,6 +31,7 @@ import {
   useRef,
   useState,
   type FormEvent,
+  type ClipboardEvent as ReactClipboardEvent,
   type PointerEvent as ReactPointerEvent,
 } from "react";
 import ReactMarkdown from "react-markdown";
@@ -193,6 +194,56 @@ function userInputFromDraft(
   for (const upload of uploads)
     input.push({ type: "image", url: upload.dataUrl, detail: "auto" });
   return input;
+}
+
+function imagesFromClipboard(data: DataTransfer): {
+  containsImage: boolean;
+  files: File[];
+} {
+  const items = Array.from(data.items).filter(
+    (item) => item.kind === "file" && item.type.startsWith("image/"),
+  );
+  const itemFiles = items.flatMap((item) => {
+    const file = item.getAsFile();
+    return file ? [file] : [];
+  });
+  const fileListImages = Array.from(data.files).filter((file) =>
+    file.type.startsWith("image/"),
+  );
+  const sameClipboardFile = (left: File, right: File) =>
+    left.type === right.type &&
+    left.size === right.size &&
+    left.lastModified === right.lastModified;
+  const matchedItemFiles = new Set<number>();
+  const additionalFiles = fileListImages.filter((file) => {
+    const matchingIndex = itemFiles.findIndex(
+      (itemFile, index) =>
+        !matchedItemFiles.has(index) && sameClipboardFile(file, itemFile),
+    );
+    if (matchingIndex === -1) return true;
+    matchedItemFiles.add(matchingIndex);
+    return false;
+  });
+
+  return {
+    containsImage: items.length > 0 || fileListImages.length > 0,
+    files: [...itemFiles, ...additionalFiles],
+  };
+}
+
+function textFromClipboardWithImages(data: DataTransfer): string {
+  let text = data.getData("text/plain");
+  if (!text) {
+    const html = data.getData("text/html");
+    if (html) {
+      const parsed = new DOMParser().parseFromString(html, "text/html");
+      parsed
+        .querySelectorAll("script, style")
+        .forEach((element) => element.remove());
+      text = parsed.body.innerText || parsed.body.textContent || "";
+    }
+  }
+  return text.replace(/data:image\/[a-z0-9.+-]+;base64,[a-z0-9+/=\r\n]+/gi, "");
 }
 
 function shortError(error: unknown): string {
@@ -516,6 +567,22 @@ export default function App() {
   const [showSettings, setShowSettings] = useState(false);
   const [composer, setComposer] = useState("");
   const [uploads, setUploads] = useState<PendingUpload[]>([]);
+  const uploadsRef = useRef(uploads);
+  const updateUploads = (
+    next: PendingUpload[] | ((current: PendingUpload[]) => PendingUpload[]),
+  ) => {
+    const value = typeof next === "function" ? next(uploadsRef.current) : next;
+    uploadsRef.current = value;
+    setUploads(value);
+  };
+  const clearUploadsIfUnchanged = (expected: PendingUpload[]) => {
+    const expectedIds = expected.map((upload) => upload.id).join("\u0000");
+    updateUploads((current) =>
+      current.map((upload) => upload.id).join("\u0000") === expectedIds
+        ? []
+        : current,
+    );
+  };
   const [compressingUploads, setCompressingUploads] = useState(false);
   const compressingUploadsRef = useRef(false);
   const [sending, setSending] = useState(false);
@@ -1679,18 +1746,20 @@ export default function App() {
     setNotice(null);
     const selectionAtSend = selectedRef.current;
     const loadVersionAtSend = loadVersionRef.current;
+    const composerAtSend = composer;
+    const uploadsAtSend = [...uploads];
     let threadId = selectedThread?.id;
     const threadIdAtSend = threadId ?? null;
     const turnIdAtSend = activeTurnId;
     try {
-      const input = userInputFromDraft(composer, uploads);
+      const input = userInputFromDraft(composerAtSend, uploadsAtSend);
 
       if (shouldSteer) {
         const attemptKey = JSON.stringify([
           threadIdAtSend,
           turnIdAtSend,
-          composer,
-          uploads.map((upload) => upload.id),
+          composerAtSend,
+          uploadsAtSend.map((upload) => upload.id),
         ]);
         const clientUserMessageId =
           steerAttemptRef.current?.key === attemptKey
@@ -1717,10 +1786,15 @@ export default function App() {
           selectedRef.current === threadIdAtSend &&
           loadVersionRef.current === loadVersionAtSend
         ) {
-          setComposer("");
-          if (composerRef.current) composerRef.current.style.height = "39px";
-          setUploads([]);
-          steerAttemptRef.current = null;
+          const composerUnchanged =
+            (composerRef.current?.value ?? composerAtSend) === composerAtSend;
+          if (composerUnchanged) {
+            setComposer("");
+            if (composerRef.current) composerRef.current.style.height = "39px";
+          }
+          clearUploadsIfUnchanged(uploadsAtSend);
+          if (composerUnchanged && uploadsRef.current.length === 0)
+            steerAttemptRef.current = null;
         }
         setNotice({
           tone: "success",
@@ -1834,9 +1908,11 @@ export default function App() {
       if (selectedRef.current === threadId) {
         setActiveTurnId(response.turn.id);
         setTurnActive(response.turn.status === "inProgress");
-        setComposer("");
-        if (composerRef.current) composerRef.current.style.height = "39px";
-        setUploads([]);
+        if ((composerRef.current?.value ?? composerAtSend) === composerAtSend) {
+          setComposer("");
+          if (composerRef.current) composerRef.current.style.height = "39px";
+        }
+        clearUploadsIfUnchanged(uploadsAtSend);
         setShowSettings(false);
       }
     } catch (error) {
@@ -1908,15 +1984,22 @@ export default function App() {
       let clearedDraft = false;
       if (
         selectedRef.current === threadIdAtQueue &&
-        loadVersionRef.current === loadVersionAtQueue &&
-        composer === textAtQueue &&
-        uploads.map((upload) => upload.id).join("\u0000") ===
-          uploadsAtQueue.map((upload) => upload.id).join("\u0000")
+        loadVersionRef.current === loadVersionAtQueue
       ) {
-        setComposer("");
-        if (composerRef.current) composerRef.current.style.height = "39px";
-        setUploads([]);
-        clearedDraft = true;
+        const composerUnchanged =
+          (composerRef.current?.value ?? textAtQueue) === textAtQueue;
+        const uploadIdsAtQueue = uploadsAtQueue
+          .map((upload) => upload.id)
+          .join("\u0000");
+        const uploadsUnchanged =
+          uploadsRef.current.map((upload) => upload.id).join("\u0000") ===
+          uploadIdsAtQueue;
+        if (composerUnchanged) {
+          setComposer("");
+          if (composerRef.current) composerRef.current.style.height = "39px";
+        }
+        clearUploadsIfUnchanged(uploadsAtQueue);
+        clearedDraft = composerUnchanged && uploadsUnchanged;
       }
       if (clearedDraft) queueAttemptRef.current = null;
       setNotice({
@@ -2019,8 +2102,24 @@ export default function App() {
     }
   };
 
-  const addImages = async (files: FileList | null) => {
-    if (!files?.length || compressingUploadsRef.current) return;
+  const addImages = async (files: FileList | File[] | null) => {
+    if (!files?.length) return;
+    const blockedReason = compressingUploadsRef.current
+      ? "Wait for the current image to finish processing before adding another."
+      : sending || queueingRef.current
+        ? "Wait for the current message to finish before adding an image."
+        : connection !== "online"
+          ? "Connect to Codex before adding an image."
+          : loadingThread ||
+              selectedRef.current !== (selectedThread?.id ?? null)
+            ? "Wait for the selected conversation to finish loading before adding an image."
+            : selectedThread?.canAcceptDirectInput === false
+              ? "This agent is controlled by its parent and cannot accept images."
+              : null;
+    if (blockedReason) {
+      setNotice({ tone: "error", text: blockedReason });
+      return;
+    }
     const accepted = Array.from(files).filter((file) =>
       file.type.startsWith("image/"),
     );
@@ -2050,7 +2149,7 @@ export default function App() {
       for (const file of accepted) {
         converted.push({
           id: crypto.randomUUID(),
-          name: file.name,
+          name: file.name || "Pasted image",
           dataUrl: await compressImage(file),
           size: file.size,
         });
@@ -2068,7 +2167,7 @@ export default function App() {
         });
         return;
       }
-      setUploads(combined);
+      updateUploads(combined);
       setNotice(null);
     } catch (error) {
       setNotice({ tone: "error", text: shortError(error) });
@@ -2076,6 +2175,39 @@ export default function App() {
       compressingUploadsRef.current = false;
       setCompressingUploads(false);
     }
+  };
+
+  const handleComposerPaste = (
+    event: ReactClipboardEvent<HTMLTextAreaElement>,
+  ) => {
+    const clipboard = event.clipboardData;
+    const pasted = imagesFromClipboard(clipboard);
+    if (!pasted.containsImage) return;
+
+    event.preventDefault();
+    const text = textFromClipboardWithImages(clipboard);
+    if (text) {
+      const textarea = event.currentTarget;
+      const start = textarea.selectionStart;
+      const end = textarea.selectionEnd;
+      const nextComposer = `${composer.slice(0, start)}${text}${composer.slice(end)}`;
+      const caret = start + text.length;
+      setComposer(nextComposer);
+      requestAnimationFrame(() => {
+        textarea.setSelectionRange(caret, caret);
+        textarea.style.height = "auto";
+        textarea.style.height = `${textarea.scrollHeight}px`;
+      });
+    }
+
+    if (!pasted.files.length) {
+      setNotice({
+        tone: "error",
+        text: "Could not read the pasted image. Try copying it again or use Attach image.",
+      });
+      return;
+    }
+    void addImages(pasted.files);
   };
 
   const replyApproval = (result: unknown) => {
@@ -2592,7 +2724,7 @@ export default function App() {
                         selectedThread?.canAcceptDirectInput === false
                       }
                       onClick={() =>
-                        setUploads((current) =>
+                        updateUploads((current) =>
                           current.filter((item) => item.id !== upload.id),
                         )
                       }
@@ -2609,6 +2741,7 @@ export default function App() {
             <textarea
               ref={composerRef}
               id="composer"
+              onPaste={handleComposerPaste}
               value={composer}
               onChange={(event) => {
                 setComposer(event.target.value);
