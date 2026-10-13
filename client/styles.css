@@ -822,6 +822,7 @@ button:disabled {
 }
 .load-history-button {
   display: inline-flex;
+  flex-shrink: 0;
   align-self: center;
   align-items: center;
   gap: 7px;
@@ -954,6 +955,7 @@ button:disabled {
 .message-row {
   display: flex;
   width: 100%;
+  flex-shrink: 0;
   margin: 0 0 25px;
   animation: enter 0.2s ease both;
 }
@@ -1163,6 +1165,7 @@ button:disabled {
 }
 .activity-card {
   width: min(100% - 35px, 680px);
+  flex-shrink: 0;
   margin: -11px 0 20px 35px;
   overflow: hidden;
   border: 1px solid var(--border);
@@ -1472,6 +1475,7 @@ button:disabled {
 .reasoning-card {
   width: max-content;
   max-width: calc(100% - 35px);
+  flex-shrink: 0;
   margin: -13px 0 16px 35px;
   color: var(--text-standard);
   font-size: 10px;
@@ -1505,17 +1509,79 @@ button:disabled {
 }
 .system-item {
   align-self: center;
+  flex-shrink: 0;
   margin: 0 0 17px;
   color: var(--muted);
   font-size: 9.5px;
 }
 .thinking-indicator {
   display: inline-flex;
+  flex-shrink: 0;
   align-items: center;
   gap: 5px;
   margin: 1px 0 8px 35px;
   color: var(--text-standard);
   font-size: 10px;
+}
+.response-activity-run {
+  width: min(100% - 35px, 680px);
+  flex-shrink: 0;
+  margin: -11px 0 20px 35px;
+}
+.response-activity-toggle {
+  display: flex;
+  width: 100%;
+  min-height: 36px;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text-strong);
+  background: var(--surface-subtle);
+  text-align: left;
+  cursor: pointer;
+}
+.response-activity-toggle:hover {
+  background: var(--surface-hover);
+}
+.response-activity-count {
+  flex: 0 0 auto;
+  font-size: 9.5px;
+  font-weight: 600;
+}
+.response-activity-preview {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  color: var(--text-standard);
+  font-size: 9px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.response-activity-toggle .activity-chevron {
+  flex: 0 0 auto;
+}
+.response-activity-toggle[aria-expanded="true"] .activity-chevron {
+  transform: rotate(180deg);
+}
+.response-activity-items {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-top: 7px;
+}
+.response-activity-items[hidden] {
+  display: none;
+}
+.response-activity-items > .activity-card {
+  width: 100%;
+  margin: 0;
+}
+.response-activity-items > .reasoning-card {
+  width: 100%;
+  max-width: 100%;
+  margin: 0;
 }
 .thinking-indicator span {
   width: 4px;

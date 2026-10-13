@@ -51,6 +51,14 @@ import type {
 import "./styles.css";
 
 type TimelineItem = ThreadItemEntry & { streaming?: boolean };
+type TimelineGroup =
+  | { kind: "message"; key: string; entry: TimelineItem }
+  | {
+      kind: "activity";
+      key: string;
+      responseKey: string;
+      entries: TimelineItem[];
+    };
 type ThreadTrailEntry = { id: string; title: string };
 type ConversationRoute = { kind: "new" } | { kind: "thread"; threadId: string };
 type ConversationHistoryState = {
@@ -552,6 +560,9 @@ export default function App() {
   );
   const [items, setItems] = useState<TimelineItem[]>([]);
   const itemsRef = useRef<TimelineItem[]>([]);
+  const [activityGroupOverrides, setActivityGroupOverrides] = useState<
+    Record<string, boolean>
+  >({});
   const liveItemsRef = useRef(new Set<string>());
   const [itemCursor, setItemCursor] = useState<string | null>(null);
   const [loadingOlderItems, setLoadingOlderItems] = useState(false);
@@ -1704,6 +1715,7 @@ export default function App() {
         .includes(query),
     );
   }, [threadSearch, threads]);
+  const timelineGrouping = useMemo(() => groupTimelineItems(items), [items]);
 
   const sendMessage = async (
     event?: FormEvent<HTMLFormElement>,
@@ -2686,13 +2698,34 @@ export default function App() {
               </div>
             </div>
           ) : null}
-          {items.map((entry) => (
-            <TimelineCard
-              key={`${entry.turnId}-${entry.item.id}`}
-              entry={entry}
-              onOpenThread={openAgentThread}
-            />
-          ))}
+          {timelineGrouping.groups.map((group) => {
+            if (group.kind === "message")
+              return (
+                <TimelineCard
+                  key={group.key}
+                  entry={group.entry}
+                  onOpenThread={openAgentThread}
+                />
+              );
+            const openKey = `${selectedRef.current ?? "new"}:${group.responseKey}`;
+            const isOpen =
+              activityGroupOverrides[openKey] ??
+              group.responseKey === timelineGrouping.latestResponseKey;
+            return (
+              <ResponseActivityGroup
+                key={group.key}
+                entries={group.entries}
+                isOpen={isOpen}
+                onToggle={() =>
+                  setActivityGroupOverrides((current) => ({
+                    ...current,
+                    [openKey]: !isOpen,
+                  }))
+                }
+                onOpenThread={openAgentThread}
+              />
+            );
+          })}
           {turnActive && !items.some((entry) => entry.streaming) ? (
             <div className="thinking-indicator">
               <span />
@@ -3144,6 +3177,72 @@ function UnavailableScreen({
   );
 }
 
+function ResponseActivityGroup({
+  entries,
+  isOpen,
+  onToggle,
+  onOpenThread,
+}: {
+  entries: TimelineItem[];
+  isOpen: boolean;
+  onToggle: () => void;
+  onOpenThread: (threadId: string, parentThreadId?: string) => void;
+}) {
+  const activityLabels = entries
+    .slice(0, 2)
+    .map((entry) => activityLabel(entry.item));
+  const remainingCount = entries.length - activityLabels.length;
+
+  return (
+    <section className="response-activity-run">
+      <button
+        type="button"
+        className="response-activity-toggle"
+        aria-expanded={isOpen}
+        aria-label={`${isOpen ? "Hide" : "Show"} ${entries.length} activity ${entries.length === 1 ? "item" : "items"} for this response`}
+        onClick={onToggle}
+      >
+        <span className="response-activity-count">
+          {entries.length} {entries.length === 1 ? "activity" : "activities"}
+        </span>
+        <span className="response-activity-preview">
+          {activityLabels.join(" · ")}
+          {remainingCount > 0 ? ` · +${remainingCount} more` : ""}
+        </span>
+        <ChevronDown className="activity-chevron" size={15} />
+      </button>
+      <div className="response-activity-items" hidden={!isOpen}>
+        {entries.map((entry) => (
+          <TimelineCard
+            key={`${entry.turnId}-${entry.item.id}`}
+            entry={entry}
+            onOpenThread={onOpenThread}
+          />
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function activityLabel(item: ThreadItem): string {
+  if (item.type === "commandExecution") return "Command";
+  if (item.type === "fileChange") return "File changes";
+  if (item.type === "reasoning") return "Reasoning";
+  if (item.type === "plan") return "Plan";
+  if (item.type === "webSearch") return "Web search";
+  if (item.type === "mcpToolCall")
+    return (
+      [asString(item.server), asString(item.tool)]
+        .filter(Boolean)
+        .join(" · ") || "MCP tool"
+    );
+  if (item.type === "dynamicToolCall")
+    return asString(item.tool) || "Tool call";
+  if (item.type === "collabAgentToolCall") return "Subagent";
+  if (item.type === "subAgentActivity") return "Subagent activity";
+  return humanizeItemType(item.type);
+}
+
 function TimelineCard({
   entry,
   onOpenThread,
@@ -3175,14 +3274,13 @@ function TimelineCard({
           <Code2 size={15} />
         </div>
         <div className="assistant-content">
-          <div className="assistant-byline">
-            Codex
-            {entry.streaming ? (
+          {entry.streaming ? (
+            <div className="assistant-byline">
               <span className="live-label">
                 <i /> Writing
               </span>
-            ) : null}
-          </div>
+            </div>
+          ) : null}
           <MarkdownContent text={text} />
           {item.delivery === "failed" ? (
             <p className="delivery-error">
@@ -4155,6 +4253,100 @@ function mergeHistoryWithLive(
   return Array.from(byId.values()).sort(
     (a, b) => (a.startedAtMs ?? 0) - (b.startedAtMs ?? 0),
   );
+}
+
+function groupTimelineItems(items: TimelineItem[]): {
+  groups: TimelineGroup[];
+  latestResponseKey: string | null;
+} {
+  const groups: TimelineGroup[] = [];
+  let pendingActivity: TimelineItem[] = [];
+  let pendingResponseKey: string | null = null;
+  let currentResponseKey: string | null = null;
+  let latestResponseKey: string | null = null;
+  const responseKeysByTurn = new Map<string, string>();
+  const responseKeyFor = (entry: TimelineItem) => {
+    if (!entry.turnId) return `user:${entry.item.id}`;
+    const knownResponseKey = responseKeysByTurn.get(entry.turnId);
+    if (knownResponseKey) return knownResponseKey;
+    const responseKey = `turn:${entry.turnId}`;
+    responseKeysByTurn.set(entry.turnId, responseKey);
+    return responseKey;
+  };
+  const flushPendingActivity = () => {
+    if (pendingActivity.length && pendingResponseKey) {
+      const first = pendingActivity[0];
+      groups.push({
+        kind: "activity",
+        key: `activity:${pendingResponseKey}:${first.item.id}`,
+        responseKey: pendingResponseKey,
+        entries: pendingActivity,
+      });
+    }
+    pendingActivity = [];
+    pendingResponseKey = null;
+  };
+
+  for (const entry of items) {
+    if (entry.item.type === "userMessage") {
+      flushPendingActivity();
+      currentResponseKey = responseKeyFor(entry);
+      latestResponseKey = currentResponseKey;
+      groups.push({
+        kind: "message",
+        key: `item:${entry.turnId}:${entry.item.id}`,
+        entry,
+      });
+      continue;
+    }
+
+    if (entry.turnId) {
+      const turnResponseKey = responseKeysByTurn.get(entry.turnId);
+      if (turnResponseKey) currentResponseKey = turnResponseKey;
+      else {
+        currentResponseKey = `turn:${entry.turnId}`;
+        responseKeysByTurn.set(entry.turnId, currentResponseKey);
+      }
+    }
+
+    if (entry.item.type === "contextCompaction") {
+      flushPendingActivity();
+      groups.push({
+        kind: "message",
+        key: `item:${entry.turnId}:${entry.item.id}`,
+        entry,
+      });
+    } else if (entry.item.type === "agentMessage") {
+      flushPendingActivity();
+      currentResponseKey ??= `assistant:${entry.item.id}`;
+      latestResponseKey = currentResponseKey;
+      groups.push({
+        kind: "message",
+        key: `item:${entry.turnId}:${entry.item.id}`,
+        entry,
+      });
+    } else {
+      if (!currentResponseKey) {
+        flushPendingActivity();
+        groups.push({
+          kind: "message",
+          key: `item:${entry.turnId}:${entry.item.id}`,
+          entry,
+        });
+        continue;
+      }
+      if (
+        pendingActivity.length > 0 &&
+        pendingResponseKey !== currentResponseKey
+      )
+        flushPendingActivity();
+      pendingResponseKey = currentResponseKey;
+      pendingActivity.push(entry);
+      latestResponseKey = currentResponseKey;
+    }
+  }
+  flushPendingActivity();
+  return { groups, latestResponseKey };
 }
 
 function formatUnknown(value: unknown): string {
