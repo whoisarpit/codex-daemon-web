@@ -7,6 +7,26 @@
       content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content"
     />
     <meta name="theme-color" content="#f7f7f4" />
+    <script>
+      (() => {
+        let choice = "system";
+        try {
+          const storedChoice = localStorage.getItem("codex-daemon-web-theme");
+          if (storedChoice === "light" || storedChoice === "dark")
+            choice = storedChoice;
+        } catch {}
+        const dark =
+          choice === "dark" ||
+          (choice === "system" &&
+            window.matchMedia("(prefers-color-scheme: dark)").matches);
+        const root = document.documentElement;
+        root.dataset.themeChoice = choice;
+        root.dataset.theme = dark ? "dark" : "light";
+        document.querySelector('meta[name="theme-color"]').content = dark
+          ? "#111511"
+          : "#f7f7f4";
+      })();
+    </script>
     <meta
       name="description"
       content="A focused web workspace for your Codex daemon."

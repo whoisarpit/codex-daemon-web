@@ -20,6 +20,7 @@ import {
   Plus,
   Shield,
   Square,
+  Sun,
   Terminal,
   X,
 } from "lucide-react";
@@ -63,14 +64,25 @@ type PendingUpload = {
   dataUrl: string;
   size: number;
 };
+type ThemeChoice = "system" | "light" | "dark";
 type AppNotice = { tone: "info" | "error" | "success"; text: string };
 
 const selectedThreadKey = "codex-desk.selected-thread";
+const themeChoiceKey = "codex-daemon-web-theme";
 const maxTurnRequestBytes = 900 * 1024;
 const maxAttachmentBytes = 700 * 1024;
 const maxCompressedImageBytes = 320 * 1024;
 const maxImageFileBytes = 20 * 1024 * 1024;
 const maxImageCount = 4;
+
+function readThemeChoice(): ThemeChoice {
+  try {
+    const value = localStorage.getItem(themeChoiceKey);
+    return value === "light" || value === "dark" ? value : "system";
+  } catch {
+    return "system";
+  }
+}
 
 function routeHash(route: ConversationRoute): string {
   return route.kind === "new"
@@ -283,6 +295,46 @@ function titleFor(thread: ThreadSummary): string {
   );
 }
 
+function sortThreadsByRecency(threads: ThreadSummary[]): ThreadSummary[] {
+  return [...threads].sort((left, right) => {
+    if (left.recencyAt === null && right.recencyAt !== null) return 1;
+    if (left.recencyAt !== null && right.recencyAt === null) return -1;
+    if (
+      left.recencyAt !== null &&
+      right.recencyAt !== null &&
+      left.recencyAt !== right.recencyAt
+    )
+      return right.recencyAt - left.recencyAt;
+    if (left.createdAt !== right.createdAt)
+      return right.createdAt - left.createdAt;
+    return left.id.localeCompare(right.id);
+  });
+}
+
+function mergeThreadPage(
+  current: ThreadSummary[],
+  incoming: ThreadSummary[],
+  append: boolean,
+  sortByRecency: boolean,
+): ThreadSummary[] {
+  const merged = new Map(
+    append ? current.map((thread) => [thread.id, thread]) : [],
+  );
+  for (const thread of incoming) {
+    const existing = merged.get(thread.id);
+    if (
+      sortByRecency &&
+      existing?.recencyAt !== null &&
+      existing?.recencyAt !== undefined &&
+      (thread.recencyAt === null || thread.recencyAt < existing.recencyAt)
+    )
+      continue;
+    merged.set(thread.id, thread);
+  }
+  const unique = Array.from(merged.values());
+  return sortByRecency ? sortThreadsByRecency(unique) : unique;
+}
+
 function statusLabel(state: ConnectionState): string {
   if (state === "online") return "Connected";
   if (state === "offline") return "Offline";
@@ -381,6 +433,7 @@ function useRpc() {
 }
 
 export default function App() {
+  const [themeChoice, setThemeChoice] = useState<ThemeChoice>(readThemeChoice);
   const [booting, setBooting] = useState(true);
   const [status, setStatus] = useState<DaemonStatus | null>(null);
   const [statusError, setStatusError] = useState("");
@@ -506,6 +559,31 @@ export default function App() {
   const newConversationRef = useRef<
     (historyMode?: "push" | "replace" | "none") => void
   >(() => {});
+
+  useEffect(() => {
+    const root = document.documentElement;
+    const systemPreference = window.matchMedia("(prefers-color-scheme: dark)");
+    const applyTheme = () => {
+      const resolvedTheme =
+        themeChoice === "system"
+          ? systemPreference.matches
+            ? "dark"
+            : "light"
+          : themeChoice;
+      root.dataset.themeChoice = themeChoice;
+      root.dataset.theme = resolvedTheme;
+      document
+        .querySelector('meta[name="theme-color"]')
+        ?.setAttribute(
+          "content",
+          resolvedTheme === "dark" ? "#111511" : "#f7f7f4",
+        );
+    };
+
+    applyTheme();
+    systemPreference.addEventListener("change", applyTheme);
+    return () => systemPreference.removeEventListener("change", applyTheme);
+  }, [themeChoice]);
 
   useEffect(() => {
     const root = document.documentElement;
@@ -745,16 +823,14 @@ export default function App() {
           nextCursor: string | null;
         }>("thread/list", {
           limit: 40,
-          sortKey: "updated_at",
+          sortKey: archived ? "updated_at" : "recency_at",
           sortDirection: "desc",
           archived,
           ...(append && threadCursor ? { cursor: threadCursor } : {}),
         });
-        setThreads((current) => {
-          const combined = append ? [...current, ...result.data] : result.data;
-          const unique = new Map(combined.map((thread) => [thread.id, thread]));
-          return Array.from(unique.values());
-        });
+        setThreads((current) =>
+          mergeThreadPage(current, result.data, append, !archived),
+        );
         setThreadCursor(result.nextCursor);
       } catch (error) {
         setNotice({
@@ -814,10 +890,10 @@ export default function App() {
       }
       if (method === "thread/started" && isRecord(params.thread)) {
         const newThread = params.thread as unknown as ThreadSummary;
-        setThreads((current) => [
-          newThread,
-          ...current.filter((entry) => entry.id !== newThread.id),
-        ]);
+        if (!archivedThreads)
+          setThreads((current) =>
+            mergeThreadPage(current, [newThread], true, true),
+          );
         return;
       }
       if (method === "thread/name/updated") {
@@ -845,6 +921,8 @@ export default function App() {
       }
 
       const threadId = asString(params.threadId);
+      if (method === "turn/started" && client)
+        void refreshThreads(client, archivedThreads, false);
       if (threadId && threadId !== selectedRef.current) return;
 
       if (method === "turn/started" && isRecord(params.turn)) {
@@ -992,7 +1070,7 @@ export default function App() {
         return;
       }
     },
-    [activeTurnId],
+    [activeTurnId, archivedThreads, client, refreshThreads],
   );
 
   const handleServerRequest = useCallback((request: ApprovalPrompt) => {
@@ -1071,8 +1149,9 @@ export default function App() {
               name: null,
               preview: "",
               cwd: response.cwd,
-              updatedAt: Date.now() / 1000,
-              createdAt: Date.now() / 1000,
+              updatedAt: 0,
+              createdAt: 0,
+              recencyAt: null,
               model: response.model,
               reasoningEffort: response.reasoningEffort,
               status: response.thread.status,
@@ -1633,6 +1712,7 @@ export default function App() {
           return;
         }
         await client.request<{ turnId: string }>("turn/steer", steerParams);
+        void refreshThreads(client, archivedThreads, false);
         if (
           selectedRef.current === threadIdAtSend &&
           loadVersionRef.current === loadVersionAtSend
@@ -1698,10 +1778,10 @@ export default function App() {
           model: string;
           cwd: string;
         }>("thread/start", startParams);
-        setThreads((current) => [
-          started.thread,
-          ...current.filter((entry) => entry.id !== started.thread.id),
-        ]);
+        if (!archivedThreads)
+          setThreads((current) =>
+            mergeThreadPage(current, [started.thread], true, true),
+          );
         if (
           loadVersionRef.current !== loadVersionAtSend ||
           selectedRef.current !== selectionAtSend ||
@@ -1759,7 +1839,6 @@ export default function App() {
         setUploads([]);
         setShowSettings(false);
       }
-      void refreshThreads(client, archivedThreads, false);
     } catch (error) {
       setNotice({
         tone: "error",
@@ -2200,7 +2279,13 @@ export default function App() {
                         {thread.preview || thread.cwd}
                       </span>
                       <span className="thread-meta">
-                        <span>{formatRelativeTime(thread.updatedAt)}</span>
+                        <span>
+                          {archivedThreads
+                            ? formatRelativeTime(thread.updatedAt)
+                            : thread.recencyAt === null
+                              ? "—"
+                              : formatRelativeTime(thread.recencyAt)}
+                        </span>
                         <span>
                           {thread.cwd.split("/").filter(Boolean).at(-1) ||
                             thread.cwd}
@@ -2301,6 +2386,24 @@ export default function App() {
             <ChevronDown size={14} />
           </div>
           <div className="topbar-right">
+            <label className="theme-control" title="Color theme">
+              <Sun size={14} aria-hidden="true" />
+              <select
+                aria-label="Color theme"
+                value={themeChoice}
+                onChange={(event) => {
+                  const nextTheme = event.currentTarget.value as ThemeChoice;
+                  setThemeChoice(nextTheme);
+                  try {
+                    localStorage.setItem(themeChoiceKey, nextTheme);
+                  } catch {}
+                }}
+              >
+                <option value="system">System</option>
+                <option value="light">Light</option>
+                <option value="dark">Dark</option>
+              </select>
+            </label>
             <span className={`connection-pill ${currentConnection}`}>
               <span className="status-dot" />
               {statusLabel(currentConnection)}

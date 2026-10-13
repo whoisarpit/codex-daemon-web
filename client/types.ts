@@ -70,6 +70,7 @@ export type ThreadSummary = {
   cwd: string;
   updatedAt: number;
   createdAt: number;
+  recencyAt: number | null;
   model: string | null;
   reasoningEffort: string | null;
   status: ThreadStatus;
