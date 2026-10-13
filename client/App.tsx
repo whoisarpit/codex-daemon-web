@@ -46,6 +46,7 @@ import type {
   ThreadItem,
   ThreadItemEntry,
   ThreadSummary,
+  ThreadTokenUsage,
   UserInput,
 } from "./types";
 import "./styles.css";
@@ -305,6 +306,80 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function asString(value: unknown, fallback = ""): string {
   return typeof value === "string" ? value : fallback;
+}
+
+function ContextUsageIndicator({ usage }: { usage: ThreadTokenUsage | null }) {
+  const [open, setOpen] = useState(false);
+  const used = usage?.last.totalTokens;
+  const limit = usage?.modelContextWindow;
+  const known =
+    typeof used === "number" &&
+    Number.isFinite(used) &&
+    used >= 0 &&
+    typeof limit === "number" &&
+    Number.isFinite(limit) &&
+    limit > 0;
+  const usedPercent = known ? (used / limit) * 100 : null;
+  const arcPercent = usedPercent === null ? 0 : Math.min(100, usedPercent);
+  const remainingPercent =
+    usedPercent === null ? null : Math.max(0, 100 - usedPercent);
+  const roundedPercent = usedPercent === null ? null : Math.round(usedPercent);
+  const tone =
+    usedPercent === null
+      ? "unknown"
+      : usedPercent >= 100
+        ? "full"
+        : usedPercent >= 85
+          ? "warning"
+          : "normal";
+  const formatTokens = (value: number) => new Intl.NumberFormat().format(value);
+  const details =
+    known && usedPercent !== null && remainingPercent !== null
+      ? `Context: ${formatTokens(used)} of ${formatTokens(limit)} tokens used; ${usedPercent.toFixed(1)}% used; ${remainingPercent!.toFixed(1)}% remaining.`
+      : "Context usage is unavailable from Codex.";
+  const label =
+    roundedPercent === null
+      ? "Context usage unavailable"
+      : `Context usage ${roundedPercent}%`;
+  const circumference = 2 * Math.PI * 8;
+
+  return (
+    <span className={`context-usage-wrap ${open ? "is-open" : ""}`}>
+      <button
+        type="button"
+        className={`context-usage-button ${tone}`}
+        aria-label={label}
+        aria-expanded={open}
+        aria-describedby="context-usage-details"
+        onClick={() => setOpen((current) => !current)}
+        onBlur={() => setOpen(false)}
+      >
+        <svg aria-hidden="true" viewBox="0 0 20 20">
+          <circle className="context-usage-track" cx="10" cy="10" r="8" />
+          {known ? (
+            <circle
+              className="context-usage-arc"
+              cx="10"
+              cy="10"
+              r="8"
+              transform="rotate(-90 10 10)"
+              strokeDasharray={circumference}
+              strokeDashoffset={circumference * (1 - arcPercent / 100)}
+            />
+          ) : null}
+        </svg>
+        <span>{roundedPercent === null ? "?" : `${roundedPercent}%`}</span>
+        <span className="context-usage-name">Context</span>
+      </button>
+      <span
+        className="context-usage-tooltip"
+        id="context-usage-details"
+        role="tooltip"
+      >
+        {details}
+      </span>
+    </span>
+  );
 }
 
 function userInputFromDraft(
@@ -626,6 +701,8 @@ export default function App() {
   const [threadDetails, setThreadDetails] = useState<ThreadDetails | null>(
     null,
   );
+  const [threadTokenUsage, setThreadTokenUsage] =
+    useState<ThreadTokenUsage | null>(null);
   const selectedRef = useRef<string | null>(null);
   const initialNavigationRef = useRef<{
     route: ConversationRoute;
@@ -963,6 +1040,7 @@ export default function App() {
     if (connection !== "online") {
       setApprovalQueue([]);
       setQuestionAnswers({});
+      setThreadTokenUsage(null);
     }
   }, [connection]);
   const unknownRequest = Boolean(
@@ -1038,6 +1116,7 @@ export default function App() {
     ++loadVersionRef.current;
     detach();
     selectedRef.current = null;
+    setThreadTokenUsage(null);
     const newRoute: ConversationRoute = { kind: "new" };
     routeRef.current = newRoute;
     setRoute(newRoute);
@@ -1279,6 +1358,18 @@ export default function App() {
         return;
       }
 
+      if (method === "thread/tokenUsage/updated") {
+        const threadId = asString(params.threadId);
+        if (threadId !== selectedRef.current) return;
+        const tokenUsage = params.tokenUsage;
+        setThreadTokenUsage(
+          isRecord(tokenUsage) && isRecord(tokenUsage.last)
+            ? (tokenUsage as unknown as ThreadTokenUsage)
+            : null,
+        );
+        return;
+      }
+
       if (method === "turn/started" && isRecord(params.turn)) {
         const startedTurnId = asString(params.turn.id);
         if (startedTurnId)
@@ -1302,6 +1393,13 @@ export default function App() {
       if (method === "turn/started" && client)
         void refreshThreads(client, archivedThreads, false);
       if (threadId && threadId !== selectedRef.current) return;
+
+      if (
+        method === "item/started" &&
+        isRecord(params.item) &&
+        params.item.type === "contextCompaction"
+      )
+        setThreadTokenUsage(null);
 
       if (method === "turn/started" && isRecord(params.turn)) {
         const turn = params.turn;
@@ -1473,6 +1571,7 @@ export default function App() {
       const summary =
         threadsRef.current.find((thread) => thread.id === threadId) ?? null;
       setSelectedThread(summary);
+      setThreadTokenUsage(null);
       setItems([]);
       setThreadDetails(null);
       setLoadingThread(true);
@@ -1646,6 +1745,7 @@ export default function App() {
       setRoute(nextRoute);
       updateThreadTrail(trail);
       selectedRef.current = threadId;
+      setThreadTokenUsage(null);
       sessionStorage.setItem(selectedThreadKey, threadId);
       historyHandledRef.current = `${window.location.href}|${JSON.stringify(window.history.state)}`;
 
@@ -1960,6 +2060,7 @@ export default function App() {
       setStatus({ authenticated: false, daemon: { available: false } });
       setThreads([]);
       setSelectedThread(null);
+      setThreadTokenUsage(null);
       setThreadDetails(null);
       setItems([]);
       itemsRef.current = [];
@@ -1985,6 +2086,7 @@ export default function App() {
     ++loadVersionRef.current;
     threadNavigationRef.current = false;
     selectedRef.current = null;
+    setThreadTokenUsage(null);
     sessionStorage.removeItem(selectedThreadKey);
     setSelectedThread(null);
     setThreadDetails(null);
@@ -3286,6 +3388,9 @@ export default function App() {
                   <span className="settings-label">Options</span>
                   <ChevronDown size={13} />
                 </button>
+                {selectedThread ? (
+                  <ContextUsageIndicator usage={threadTokenUsage} />
+                ) : null}
               </div>
               <div className="composer-right">
                 <span className="composer-hint">

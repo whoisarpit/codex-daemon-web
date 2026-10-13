@@ -104,6 +104,26 @@ export type ThreadDetails = {
   };
 };
 
+export type ThreadTokenUsage = {
+  total: {
+    totalTokens: number;
+    inputTokens: number;
+    cachedInputTokens: number;
+    cacheWriteInputTokens: number;
+    outputTokens: number;
+    reasoningOutputTokens: number;
+  };
+  last: {
+    totalTokens: number;
+    inputTokens: number;
+    cachedInputTokens: number;
+    cacheWriteInputTokens: number;
+    outputTokens: number;
+    reasoningOutputTokens: number;
+  };
+  modelContextWindow: number | null;
+};
+
 export type ApprovalPrompt = {
   id: RpcId;
   method: string;
