@@ -89,6 +89,7 @@ Environment variables can be set in the shell or in a local `.env` file (which i
 | `CODEX_APP_SERVER_AUTH_TOKEN` | unset                                                    | Sends a Bearer token to a configured WebSocket endpoint. Required for non-loopback `wss://` endpoints. |
 | `CODEX_WEB_ACCESS_TOKEN`      | generated token file                                     | Set a fixed login token; use at least 32 characters and keep it secret.                                |
 | `CODEX_WEB_TOKEN_FILE`        | `$XDG_STATE_HOME/codex-daemon-web/access-token`          | Change where the generated login token is stored.                                                      |
+| `CODEX_WEB_PUSH_STATE_FILE`   | next to the token file                                   | Change where the private VAPID key and browser subscriptions are stored.                               |
 | `XDG_STATE_HOME`              | `~/.local/state`                                         | Base directory for application state and the generated token.                                          |
 | `PUBLIC_URL`                  | unset                                                    | Public `http://` or `https://` origin when accessed through a reverse proxy.                           |
 | `ALLOWED_ORIGINS`             | local app origins                                        | Comma-separated browser origins allowed for login and WebSocket upgrades.                              |
@@ -116,7 +117,12 @@ The proxy must forward HTTP WebSocket upgrades to `/api/rpc`. The bridge validat
 - `POST /api/login` accepts `{ "token": "..." }`, sets an `HttpOnly`, `SameSite=Strict` session cookie, and returns status.
 - `GET /api/status` requires that cookie and returns `{ "authenticated": true, "daemon": { "available": boolean, "error?": string, "endpoint": string } }`.
 - `POST /api/logout` clears the session cookie and immediately closes that login session's active browser connections.
+- `GET /api/push/config`, `POST /api/push/subscription`, and `DELETE /api/push/subscription` require an authenticated session. The config response reports server readiness and its VAPID key; subscription routes persist each explicitly enabled browser.
 - Authenticated WebSocket clients connect to `/api/rpc`. After the backend initializes the upstream app-server, it sends `{ "method": "bridge/ready", "params": {} }`. Bridge-local failures use `{ "method": "bridge/error", "params": { "message": "..." } }`.
+
+The service worker displays a generic “Codex needs your input” notification and opens the encoded thread route when clicked. The push payload does not include question text. The bridge observes `item/tool/requestUserInput` requests on the existing browser connection and forwards them unchanged. The app-server protocol exposes these requests on the connection handling a thread; there is no global request event source, so notifications are sent only while a browser bridge is connected. Push cannot detect a question that arrives while the browser app is closed.
+
+Install Codex Desk from the browser’s app menu to open it in a standalone window. Its root-scoped service worker handles push notifications for the installed app.
 
 The browser must not send `initialize` or `initialized`; the bridge owns that handshake. It forwards app-server RPC messages after initialization. Every browser connection has independent upstream state and request IDs. WebSocket payloads are capped at 1 MiB, the bridge closes slow clients, and login attempts are rate limited by the direct peer address.
 

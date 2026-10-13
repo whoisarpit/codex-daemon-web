@@ -9,9 +9,56 @@ import {
 } from "./auth.js";
 import { config } from "./config.js";
 import { connectDaemon } from "./daemon.js";
+import { notifyUserInput } from "./push.js";
 
 const upstreamInitId = "codex-daemon-web-initialize";
 const maxBufferedBytes = 2 * 1024 * 1024;
+const notifiedRequests = new Map<string, number>();
+
+function observeUserInputRequest(text: string): void {
+  let packet: unknown;
+  try {
+    packet = JSON.parse(text);
+  } catch {
+    return;
+  }
+  if (!isJsonObject(packet) || packet.method !== "item/tool/requestUserInput")
+    return;
+  if (typeof packet.id !== "string" && typeof packet.id !== "number") {
+    return;
+  }
+  if (!isJsonObject(packet.params)) return;
+  const threadId = packet.params.threadId;
+  const turnId = packet.params.turnId;
+  const itemId = packet.params.itemId;
+  if (
+    typeof threadId !== "string" ||
+    threadId.length === 0 ||
+    threadId.length > 256 ||
+    typeof turnId !== "string" ||
+    turnId.length === 0 ||
+    turnId.length > 256 ||
+    typeof itemId !== "string" ||
+    itemId.length === 0 ||
+    itemId.length > 256
+  ) {
+    return;
+  }
+
+  const now = Date.now();
+  for (const [requestKey, observedAt] of notifiedRequests) {
+    if (now - observedAt > 60 * 60 * 1000) notifiedRequests.delete(requestKey);
+  }
+  const requestKey = JSON.stringify([threadId, turnId, itemId]);
+  if (notifiedRequests.has(requestKey)) return;
+  notifiedRequests.set(requestKey, now);
+  while (notifiedRequests.size > 1000) {
+    const oldest = notifiedRequests.keys().next().value;
+    if (oldest === undefined) break;
+    notifiedRequests.delete(oldest);
+  }
+  notifyUserInput(threadId);
+}
 
 function sendBridgeMessage(
   socket: WebSocket,
@@ -240,6 +287,7 @@ function forwardSocketPair(browser: WebSocket, sessionId: string): void {
           return;
         }
         const text = data.toString("utf8");
+        observeUserInputRequest(text);
         if (!ready) {
           let packet: unknown;
           try {

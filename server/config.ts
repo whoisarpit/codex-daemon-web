@@ -1,6 +1,6 @@
 import { homedir } from "node:os";
 import { isIP } from "node:net";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 
 export type DaemonEndpoint =
   | { kind: "unix"; path: string; label: string }
@@ -140,6 +140,15 @@ if (process.env.NODE_ENV === "development") {
 allowedOrigins.add(`http://localhost:${port}`);
 allowedOrigins.add(`http://127.0.0.1:${port}`);
 
+const tokenPath = resolve(
+  process.env.CODEX_WEB_TOKEN_FILE ||
+    join(
+      process.env.XDG_STATE_HOME || join(homedir(), ".local", "state"),
+      "codex-daemon-web",
+      "access-token",
+    ),
+);
+
 export const config = {
   host: process.env.HOST || "127.0.0.1",
   port,
@@ -150,13 +159,10 @@ export const config = {
   publicUrl,
   allowedOrigins,
   endpoint: resolveDaemonEndpoint(),
-  tokenPath: resolve(
-    process.env.CODEX_WEB_TOKEN_FILE ||
-      join(
-        process.env.XDG_STATE_HOME || join(homedir(), ".local", "state"),
-        "codex-daemon-web",
-        "access-token",
-      ),
+  tokenPath,
+  pushStatePath: resolve(
+    process.env.CODEX_WEB_PUSH_STATE_FILE ||
+      join(dirname(tokenPath), "push-state.json"),
   ),
   defaultTokenPath: !process.env.CODEX_WEB_TOKEN_FILE,
   configuredAccessToken: process.env.CODEX_WEB_ACCESS_TOKEN,

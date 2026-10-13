@@ -13,6 +13,11 @@ import {
 } from "./auth.js";
 import { config } from "./config.js";
 import { daemonAvailable, endpointLabel } from "./daemon.js";
+import {
+  deletePushSubscription,
+  pushConfiguration,
+  savePushSubscription,
+} from "./push.js";
 
 const app = express();
 const server = createServer(app);
@@ -92,6 +97,45 @@ app.get("/api/status", requireSession, async (_request, response, next) => {
   }
 });
 
+app.get(
+  "/api/push/config",
+  requireSession,
+  async (_request, response, next) => {
+    try {
+      response.setHeader("Cache-Control", "no-store");
+      response.json(await pushConfiguration());
+    } catch (error) {
+      next(error);
+    }
+  },
+);
+
+app.post(
+  "/api/push/subscription",
+  requireBrowserOrigin,
+  requireSession,
+  async (request, response, next) => {
+    try {
+      response.status(201).json(await savePushSubscription(request.body));
+    } catch (error) {
+      next(error);
+    }
+  },
+);
+
+app.delete(
+  "/api/push/subscription",
+  requireBrowserOrigin,
+  requireSession,
+  async (request, response, next) => {
+    try {
+      response.json(await deletePushSubscription(request.body?.endpoint));
+    } catch (error) {
+      next(error);
+    }
+  },
+);
+
 app.post(
   "/api/logout",
   requireBrowserOrigin,
@@ -113,6 +157,11 @@ if (process.env.NODE_ENV !== "development") {
         index: false,
         fallthrough: true,
         maxAge: "1h",
+        setHeaders: (response, path) => {
+          if (path.endsWith("/service-worker.js")) {
+            response.setHeader("Cache-Control", "no-cache");
+          }
+        },
       }),
     );
     app.get("/{*path}", (_request, response, next) => {

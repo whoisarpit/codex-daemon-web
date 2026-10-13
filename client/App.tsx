@@ -80,10 +80,15 @@ type PendingUpload = {
   size: number;
 };
 type ThemeChoice = "system" | "light" | "dark";
+type PushSetupState =
+  "loading" | "ready" | "denied" | "unsupported" | "unavailable" | "error";
 type AppNotice = { tone: "info" | "error" | "success"; text: string };
+
+type PushConfiguration = { ready: boolean; publicKey: string | null };
 
 const selectedThreadKey = "codex-desk.selected-thread";
 const themeChoiceKey = "codex-daemon-web-theme";
+const completionSoundKey = "codex-daemon-web-completion-sound";
 const maxTurnRequestBytes = 900 * 1024;
 const maxAttachmentBytes = 700 * 1024;
 const maxCompressedImageBytes = 320 * 1024;
@@ -97,6 +102,89 @@ function readThemeChoice(): ThemeChoice {
   } catch {
     return "system";
   }
+}
+
+function readCompletionSoundPreference(): boolean {
+  try {
+    return localStorage.getItem(completionSoundKey) === "true";
+  } catch {
+    return false;
+  }
+}
+
+function playCompletionTone(context: AudioContext): void {
+  if (context.state !== "running") return;
+  const oscillator = context.createOscillator();
+  const volume = context.createGain();
+  const now = context.currentTime;
+  oscillator.type = "sine";
+  oscillator.frequency.setValueAtTime(660, now);
+  oscillator.frequency.setValueAtTime(880, now + 0.1);
+  volume.gain.setValueAtTime(0.0001, now);
+  volume.gain.exponentialRampToValueAtTime(0.045, now + 0.02);
+  volume.gain.exponentialRampToValueAtTime(0.0001, now + 0.28);
+  oscillator.connect(volume);
+  volume.connect(context.destination);
+  oscillator.start(now);
+  oscillator.stop(now + 0.3);
+}
+
+function supportsQuestionNotifications(): boolean {
+  return (
+    typeof window !== "undefined" &&
+    window.isSecureContext &&
+    "Notification" in window &&
+    "PushManager" in window &&
+    "serviceWorker" in navigator
+  );
+}
+
+async function loadPushConfiguration(): Promise<PushConfiguration> {
+  const response = await fetch("/api/push/config", {
+    credentials: "same-origin",
+  });
+  if (!response.ok) throw new Error("Could not load notification settings.");
+  const result: unknown = await response.json();
+  if (
+    !isRecord(result) ||
+    typeof result.enabled !== "boolean" ||
+    (result.publicKey !== null && typeof result.publicKey !== "string")
+  )
+    throw new Error("Notification settings could not be read.");
+  return { ready: result.enabled, publicKey: result.publicKey };
+}
+
+function decodePushApplicationServerKey(value: string): Uint8Array {
+  const padding = "=".repeat((4 - (value.length % 4)) % 4);
+  const base64 = `${value.replace(/-/g, "+").replace(/_/g, "/")}${padding}`;
+  const binary = window.atob(base64);
+  const key = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1)
+    key[index] = binary.charCodeAt(index);
+  return key;
+}
+
+function pushSetupStateFor(configuration: PushConfiguration): PushSetupState {
+  if (!configuration.ready || !configuration.publicKey) return "unavailable";
+  return Notification.permission === "denied" ? "denied" : "ready";
+}
+
+async function getCurrentPushSubscription(): Promise<PushSubscription | null> {
+  const registration = await navigator.serviceWorker.getRegistration();
+  return (await registration?.pushManager.getSubscription()) ?? null;
+}
+
+async function savePushSubscription(
+  subscription: PushSubscription,
+): Promise<void> {
+  const response = await fetch("/api/push/subscription", {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(subscription.toJSON()),
+  });
+  if (!response.ok)
+    throw new Error("Could not save this device’s notification settings.");
 }
 
 function routeHash(route: ConversationRoute): string {
@@ -582,6 +670,20 @@ export default function App() {
   const [approvalPolicy, setApprovalPolicy] = useState("");
   const [sandboxMode, setSandboxMode] = useState("");
   const [showSettings, setShowSettings] = useState(false);
+  const [completionSoundEnabled, setCompletionSoundEnabled] = useState(
+    readCompletionSoundPreference,
+  );
+  const completionSoundEnabledRef = useRef(completionSoundEnabled);
+  const completionAudioContextRef = useRef<AudioContext | null>(null);
+  const eligibleCompletionTurnIdsRef = useRef(new Set<string>());
+  const [pushConfiguration, setPushConfiguration] =
+    useState<PushConfiguration | null>(null);
+  const [questionNotificationsEnabled, setQuestionNotificationsEnabled] =
+    useState(false);
+  const [pushSetupState, setPushSetupState] =
+    useState<PushSetupState>("loading");
+  const [pushBusy, setPushBusy] = useState(false);
+  const [pushError, setPushError] = useState("");
   const [composer, setComposer] = useState("");
   const [uploads, setUploads] = useState<PendingUpload[]>([]);
   const uploadsRef = useRef(uploads);
@@ -643,6 +745,92 @@ export default function App() {
   const newConversationRef = useRef<
     (historyMode?: "push" | "replace" | "none") => void
   >(() => {});
+
+  useEffect(() => {
+    completionSoundEnabledRef.current = completionSoundEnabled;
+  }, [completionSoundEnabled]);
+
+  useEffect(() => {
+    if (!completionSoundEnabled || typeof window.AudioContext === "undefined")
+      return;
+    const unlock = () => {
+      try {
+        const context =
+          completionAudioContextRef.current ?? new window.AudioContext();
+        completionAudioContextRef.current = context;
+        if (context.state === "running") {
+          document.removeEventListener("pointerdown", unlock);
+          document.removeEventListener("keydown", unlock);
+          return;
+        }
+        void context
+          .resume()
+          .then(() => {
+            if (context.state !== "running") return;
+            document.removeEventListener("pointerdown", unlock);
+            document.removeEventListener("keydown", unlock);
+          })
+          .catch(() => {});
+      } catch {}
+    };
+    document.addEventListener("pointerdown", unlock);
+    document.addEventListener("keydown", unlock);
+    return () => {
+      document.removeEventListener("pointerdown", unlock);
+      document.removeEventListener("keydown", unlock);
+    };
+  }, [completionSoundEnabled]);
+
+  useEffect(() => {
+    if (!status?.authenticated) return;
+    if (!supportsQuestionNotifications()) {
+      setPushSetupState("unsupported");
+      return;
+    }
+    let cancelled = false;
+    setPushSetupState("loading");
+    setPushError("");
+    void loadPushConfiguration()
+      .then(async (configuration) => {
+        if (cancelled) return;
+        setPushConfiguration(configuration);
+        const subscription = await getCurrentPushSubscription();
+        if (cancelled) return;
+        setQuestionNotificationsEnabled(Boolean(subscription));
+        setPushSetupState(pushSetupStateFor(configuration));
+        if (
+          subscription &&
+          configuration.ready &&
+          configuration.publicKey &&
+          Notification.permission === "granted"
+        ) {
+          try {
+            await savePushSubscription(subscription);
+          } catch (error) {
+            if (cancelled) return;
+            setPushSetupState("error");
+            setPushError(shortError(error));
+          }
+        }
+      })
+      .catch((error: unknown) => {
+        if (cancelled) return;
+        setPushSetupState("error");
+        setPushError(shortError(error));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [status?.authenticated]);
+
+  useEffect(
+    () => () => {
+      const context = completionAudioContextRef.current;
+      completionAudioContextRef.current = null;
+      if (context && context.state !== "closed") void context.close();
+    },
+    [],
+  );
 
   useEffect(() => {
     const root = document.documentElement;
@@ -1004,6 +1192,25 @@ export default function App() {
         return;
       }
 
+      if (method === "turn/started" && isRecord(params.turn)) {
+        const startedTurnId = asString(params.turn.id);
+        if (startedTurnId)
+          eligibleCompletionTurnIdsRef.current.add(startedTurnId);
+      }
+      if (method === "turn/completed" && isRecord(params.turn)) {
+        const completedTurnId = asString(params.turn.id);
+        if (
+          completedTurnId &&
+          eligibleCompletionTurnIdsRef.current.delete(completedTurnId) &&
+          completionSoundEnabledRef.current &&
+          completionAudioContextRef.current
+        ) {
+          try {
+            playCompletionTone(completionAudioContextRef.current);
+          } catch {}
+        }
+      }
+
       const threadId = asString(params.threadId);
       if (method === "turn/started" && client)
         void refreshThreads(client, archivedThreads, false);
@@ -1316,7 +1523,10 @@ export default function App() {
         const activeTurn = turnPage.data.find(
           (turn) => turn.status === "inProgress",
         );
-        if (activeTurn) setActiveTurnId(activeTurn.id);
+        if (activeTurn) {
+          eligibleCompletionTurnIdsRef.current.add(activeTurn.id);
+          setActiveTurnId(activeTurn.id);
+        }
         setLoadingThread(false);
         sessionStorage.setItem(selectedThreadKey, threadId);
         requestAnimationFrame(() => {
@@ -1472,6 +1682,120 @@ export default function App() {
     onServerRequest: handleServerRequest,
     onDisconnected: checkSessionAfterDisconnect,
     onReady,
+  };
+
+  const updateCompletionSound = (enabled: boolean) => {
+    completionSoundEnabledRef.current = enabled;
+    setCompletionSoundEnabled(enabled);
+    try {
+      localStorage.setItem(completionSoundKey, String(enabled));
+    } catch {}
+    if (typeof window.AudioContext === "undefined") return;
+    if (enabled) {
+      try {
+        const context =
+          completionAudioContextRef.current ?? new window.AudioContext();
+        completionAudioContextRef.current = context;
+        void context.resume().catch(() => {});
+      } catch {}
+      return;
+    }
+    const context = completionAudioContextRef.current;
+    completionAudioContextRef.current = null;
+    if (context && context.state !== "closed") void context.close();
+  };
+
+  const retryQuestionNotificationSetup = async () => {
+    if (pushBusy) return;
+    setPushBusy(true);
+    setPushSetupState("loading");
+    setPushError("");
+    try {
+      const configuration = await loadPushConfiguration();
+      setPushConfiguration(configuration);
+      const subscription = await getCurrentPushSubscription();
+      setQuestionNotificationsEnabled(Boolean(subscription));
+      setPushSetupState(pushSetupStateFor(configuration));
+      if (
+        subscription &&
+        configuration.ready &&
+        configuration.publicKey &&
+        Notification.permission === "granted"
+      ) {
+        await savePushSubscription(subscription);
+      }
+    } catch (error) {
+      setPushSetupState("error");
+      setPushError(shortError(error));
+    } finally {
+      setPushBusy(false);
+    }
+  };
+
+  const enableQuestionNotifications = async () => {
+    if (!pushConfiguration?.ready || !pushConfiguration.publicKey || pushBusy)
+      return;
+    setPushBusy(true);
+    setPushError("");
+    let newlyCreatedSubscription: PushSubscription | null = null;
+    try {
+      const permission = await Notification.requestPermission();
+      if (permission !== "granted") {
+        setPushSetupState("denied");
+        return;
+      }
+      await navigator.serviceWorker.register("/service-worker.js");
+      const registration = await navigator.serviceWorker.ready;
+      const existingSubscription =
+        await registration.pushManager.getSubscription();
+      const subscription =
+        existingSubscription ??
+        (newlyCreatedSubscription = await registration.pushManager.subscribe({
+          userVisibleOnly: true,
+          applicationServerKey: decodePushApplicationServerKey(
+            pushConfiguration.publicKey,
+          ) as BufferSource,
+        }));
+      await savePushSubscription(subscription);
+      setQuestionNotificationsEnabled(true);
+      setPushSetupState("ready");
+    } catch (error) {
+      if (newlyCreatedSubscription)
+        await newlyCreatedSubscription.unsubscribe().catch(() => {});
+      setPushSetupState("error");
+      setPushError(shortError(error));
+    } finally {
+      setPushBusy(false);
+    }
+  };
+
+  const disableQuestionNotifications = async () => {
+    if (!questionNotificationsEnabled || pushBusy) return;
+    setPushBusy(true);
+    setPushError("");
+    try {
+      const subscription = await getCurrentPushSubscription();
+      if (!subscription)
+        throw new Error(
+          "This browser’s notification subscription was not found.",
+        );
+      const response = await fetch("/api/push/subscription", {
+        method: "DELETE",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ endpoint: subscription.endpoint }),
+      });
+      if (!response.ok)
+        throw new Error("Could not turn off this device’s notifications.");
+      setQuestionNotificationsEnabled(false);
+      await subscription.unsubscribe().catch(() => false);
+      setPushSetupState("ready");
+    } catch (error) {
+      setPushSetupState("error");
+      setPushError(shortError(error));
+    } finally {
+      setPushBusy(false);
+    }
   };
 
   useEffect(() => {
@@ -1924,6 +2248,8 @@ export default function App() {
         turn: { id: string; status: string };
       }>("turn/start", turnParams);
       if (selectedRef.current === threadId) {
+        if (response.turn.status === "inProgress")
+          eligibleCompletionTurnIdsRef.current.add(response.turn.id);
         setActiveTurnId(response.turn.id);
         setTurnActive(response.turn.status === "inProgress");
         if ((composerRef.current?.value ?? composerAtSend) === composerAtSend) {
@@ -2936,7 +3262,7 @@ export default function App() {
                 <div className="settings-panel-heading">
                   <div>
                     <strong>Run settings</strong>
-                    <span>Applied to the next turn.</span>
+                    <span>Run choices and browser preferences.</span>
                   </div>
                   <button
                     type="button"
@@ -3037,6 +3363,79 @@ export default function App() {
                       )}
                     </div>
                   )}
+                </div>
+                <div className="settings-preferences">
+                  <div className="settings-preference">
+                    <div>
+                      <strong>Completion sound</strong>
+                      <span>
+                        Play a short tone when a turn finishes in this tab.
+                      </span>
+                    </div>
+                    <button
+                      type="button"
+                      className="settings-toggle"
+                      aria-pressed={completionSoundEnabled}
+                      disabled={typeof window.AudioContext === "undefined"}
+                      onClick={() =>
+                        updateCompletionSound(!completionSoundEnabled)
+                      }
+                    >
+                      {completionSoundEnabled ? "On" : "Off"}
+                    </button>
+                  </div>
+                  <div className="settings-preference">
+                    <div>
+                      <strong>Question notifications</strong>
+                      <span>
+                        {pushSetupState === "unsupported"
+                          ? "This browser does not support push notifications."
+                          : pushSetupState === "loading"
+                            ? "Checking notification support…"
+                            : pushSetupState === "error"
+                              ? `Notification setup needs attention: ${pushError}`
+                              : pushSetupState === "unavailable"
+                                ? "Push notifications are not configured on this server."
+                                : pushSetupState === "denied"
+                                  ? "Notifications are blocked in browser settings. Change site permission to enable them."
+                                  : questionNotificationsEnabled
+                                    ? "This device is subscribed. Keep a chat connected to receive questions."
+                                    : "Get notified when Codex asks a question. New questions won’t be detected after all chats disconnect."}
+                      </span>
+                    </div>
+                    <button
+                      type="button"
+                      className="settings-toggle"
+                      aria-pressed={questionNotificationsEnabled}
+                      disabled={
+                        pushBusy ||
+                        pushSetupState === "loading" ||
+                        (!pushConfiguration && pushSetupState !== "error") ||
+                        (pushConfiguration &&
+                          (!pushConfiguration.ready ||
+                            !pushConfiguration.publicKey) &&
+                          !questionNotificationsEnabled) ||
+                        pushSetupState === "unsupported" ||
+                        (pushSetupState === "denied" &&
+                          !questionNotificationsEnabled)
+                      }
+                      onClick={() =>
+                        questionNotificationsEnabled
+                          ? void disableQuestionNotifications()
+                          : !pushConfiguration
+                            ? void retryQuestionNotificationSetup()
+                            : void enableQuestionNotifications()
+                      }
+                    >
+                      {pushBusy
+                        ? "Saving…"
+                        : !pushConfiguration && pushSetupState === "error"
+                          ? "Retry"
+                          : questionNotificationsEnabled
+                            ? "Turn off"
+                            : "Turn on"}
+                    </button>
+                  </div>
                 </div>
               </div>
             ) : null}
