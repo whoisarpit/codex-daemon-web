@@ -3608,7 +3608,7 @@ function ResponseActivityGroup({
         onClick={onToggle}
       >
         <span className="response-activity-count">
-          {entries.length} {entries.length === 1 ? "activity" : "activities"}
+          {entries.length === 1 ? "1 activity" : `${entries.length} activities`}
         </span>
         <span className="response-activity-preview">
           {activityLabels.join(" · ")}
@@ -3630,7 +3630,12 @@ function ResponseActivityGroup({
 }
 
 function activityLabel(item: ThreadItem): string {
-  if (item.type === "commandExecution") return "Command";
+  if (item.type === "commandExecution") {
+    const command = asString(item.command).trim().replace(/\s+/g, " ");
+    if (!command) return "Ran command";
+    const preview = command.length > 48 ? `${command.slice(0, 45)}…` : command;
+    return `Ran ${preview}`;
+  }
   if (item.type === "fileChange") return "File changes";
   if (item.type === "reasoning") return "Reasoning";
   if (item.type === "plan") return "Plan";
@@ -3644,7 +3649,13 @@ function activityLabel(item: ThreadItem): string {
   if (item.type === "dynamicToolCall")
     return asString(item.tool) || "Tool call";
   if (item.type === "collabAgentToolCall") return "Subagent";
-  if (item.type === "subAgentActivity") return "Subagent activity";
+  if (item.type === "subAgentActivity") {
+    const path = asString(item.agentPath);
+    const agent = path.split("/").filter(Boolean).at(-1) || "Agent";
+    const kind = asString(item.kind);
+    return `${agent} ${kind === "completed" ? "finished" : kind || "updated"}`;
+  }
+  if (item.type === "imageView") return "Viewed an image";
   return humanizeItemType(item.type);
 }
 
@@ -3675,12 +3686,9 @@ function TimelineCard({
     if (!text.trim() && item.delivery !== "failed") return null;
     return (
       <article className="message-row assistant-row">
-        <div className="assistant-mark">
-          <Code2 size={15} />
-        </div>
-        <div className="assistant-content">
+        <div className="assistant-content" aria-live="polite">
           {entry.streaming ? (
-            <div className="assistant-byline">
+            <div className="assistant-live-status">
               <span className="live-label">
                 <i /> Writing
               </span>
@@ -3698,12 +3706,8 @@ function TimelineCard({
   }
   if (item.type === "commandExecution") {
     const command = asString(item.command);
+    const compactCommand = command.trim().replace(/\s+/g, " ");
     const output = asString(item.aggregatedOutput);
-    const commandLines = command.split(/\r\n|\r|\n/);
-    const commandNeedsExpansion =
-      command.length > 180 ||
-      commandLines.length > 3 ||
-      commandLines.some((line) => line.length > 44);
     const outputLines = output.split(/\r\n|\r|\n/);
     if (/(?:\r\n|\r|\n)$/.test(output)) outputLines.pop();
     const previewLines = outputLines.slice(0, 3);
@@ -3712,71 +3716,64 @@ function TimelineCard({
       item.status ?? (entry.streaming ? "inProgress" : undefined),
     );
     return (
-      <div className="activity-card command-activity">
-        <div className="command-activity-heading">
+      <details className="activity-card command-activity">
+        <summary>
           <span className="activity-icon command">
-            <Terminal size={14} />
+            <Terminal size={13} />
           </span>
-          <span className="activity-title">
-            {command.trim()
-              ? entry.streaming
-                ? "Running command"
-                : "Command"
+          <span className="activity-title" title={compactCommand}>
+            {compactCommand
+              ? `${entry.streaming ? "Running" : "Ran"} ${compactCommand}`
               : entry.streaming
                 ? "Running command"
-                : "Command details unavailable"}
+                : "Ran command"}
           </span>
           <span className={`activity-status ${status.className}`}>
             {status.label}
           </span>
-        </div>
-        {command.trim() ? (
-          <div className="command-activity-body">
-            <pre className="command-preview">
-              <code>{command}</code>
-            </pre>
-            {commandNeedsExpansion ? (
-              <details className="command-full">
-                <summary>Show full command</summary>
-                <pre>
-                  <code>{command}</code>
-                </pre>
-              </details>
-            ) : null}
-            {asString(item.cwd) ? (
-              <div className="command-cwd">{asString(item.cwd)}</div>
-            ) : null}
-          </div>
-        ) : null}
-        {output.trim() ? (
-          <div className="command-output">
-            <div className="command-output-heading">
-              <span>OUTPUT</span>
-              {typeof item.exitCode === "number" ? (
-                <span>exit {item.exitCode}</span>
+          <ChevronDown className="activity-chevron" size={14} />
+        </summary>
+        <div className="activity-body command-activity-body">
+          {command.trim() ? (
+            <div>
+              <pre>
+                <code>{command}</code>
+              </pre>
+              {asString(item.cwd) ? (
+                <div className="command-cwd">{asString(item.cwd)}</div>
               ) : null}
             </div>
-            <pre className="command-output-preview">
-              <code>{previewLines.join("\n")}</code>
-            </pre>
-            {remainingLines.length ? (
-              <details className="command-output-more">
-                <summary>
-                  + {remainingLines.length} more{" "}
-                  {remainingLines.length === 1 ? "line" : "lines"}
-                </summary>
-                <pre>
-                  <code>{remainingLines.join("\n")}</code>
-                </pre>
-              </details>
-            ) : null}
-          </div>
-        ) : !command.trim() && !entry.streaming ? (
-          <div className="command-details-unavailable">
-            Command and output were not included in this activity item.
-          </div>
-        ) : null}
-      </div>
+          ) : null}
+          {output.trim() ? (
+            <div className="command-output">
+              <div className="command-output-heading">
+                <span>OUTPUT</span>
+                {typeof item.exitCode === "number" ? (
+                  <span>exit {item.exitCode}</span>
+                ) : null}
+              </div>
+              <pre className="command-output-preview">
+                <code>{previewLines.join("\n")}</code>
+              </pre>
+              {remainingLines.length ? (
+                <details className="command-output-more">
+                  <summary>
+                    + {remainingLines.length} more{" "}
+                    {remainingLines.length === 1 ? "line" : "lines"}
+                  </summary>
+                  <pre>
+                    <code>{remainingLines.join("\n")}</code>
+                  </pre>
+                </details>
+              ) : null}
+            </div>
+          ) : !command.trim() && !entry.streaming ? (
+            <div className="command-details-unavailable">
+              Command and output were not included in this activity item.
+            </div>
+          ) : null}
+        </div>
+      </details>
     );
   }
   if (item.type === "fileChange") {
@@ -3996,7 +3993,7 @@ function ToolActivity({
             : type === "imageGeneration"
               ? "Image generation"
               : type === "imageView"
-                ? "Viewed image"
+                ? "Viewed an image"
                 : type === "enteredReviewMode"
                   ? "Review started"
                   : type === "exitedReviewMode"
@@ -4154,10 +4151,10 @@ function SubAgentActivity({
 }) {
   const kind = asString(item.kind);
   const kindLabels: Record<string, string> = {
-    started: "Started",
-    interacted: "Updated",
-    interrupted: "Interrupted",
-    completed: "Completed",
+    started: "started",
+    interacted: "updated",
+    interrupted: "interrupted",
+    completed: "finished",
   };
   const path = asString(item.agentPath);
   const pathLabel = path.split("/").filter(Boolean).at(-1) || "Agent";
@@ -4170,14 +4167,16 @@ function SubAgentActivity({
         <Command size={14} />
       </span>
       <span className="activity-title">
-        {pathLabel} · {kindLabels[kind] ?? "Activity"}
+        {pathLabel} {kindLabels[kind] ?? "updated"}
       </span>
       {item.model ? (
         <span className="activity-context">{asString(item.model)}</span>
       ) : null}
-      <span className={`activity-status ${status.className}`}>
-        {status.label}
-      </span>
+      {kind !== "completed" ? (
+        <span className={`activity-status ${status.className}`}>
+          {status.label}
+        </span>
+      ) : null}
       {threadId ? (
         <button
           type="button"
