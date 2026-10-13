@@ -2707,7 +2707,7 @@ export default function App() {
                   onOpenThread={openAgentThread}
                 />
               );
-            const openKey = `${selectedRef.current ?? "new"}:${group.responseKey}`;
+            const openKey = `${selectedRef.current ?? "new"}:${group.key}`;
             const isOpen =
               activityGroupOverrides[openKey] ??
               group.responseKey === timelineGrouping.latestResponseKey;
