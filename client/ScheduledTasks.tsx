@@ -24,6 +24,8 @@ type Props = {
   currentThread: ThreadSummary | null;
   projectCwd: string;
   models: ModelOption[];
+  visible: boolean;
+  onCountChange: (count: number) => void;
   onOpenThread: (threadId: string) => void;
 };
 
@@ -183,8 +185,14 @@ export default function ScheduledTasks(props: Props) {
             (a.nextRunAt ?? Number.MAX_SAFE_INTEGER) -
               (b.nextRunAt ?? Number.MAX_SAFE_INTEGER) ||
             a.createdAt - b.createdAt,
-        )
-        .slice(0, 4),
+        ),
+    [tasks],
+  );
+  const activeTaskCount = useMemo(
+    () =>
+      tasks.filter(
+        (task) => task.status === "active" || task.status === "paused",
+      ).length,
     [tasks],
   );
   const selectedModel = props.models.find(
@@ -216,6 +224,10 @@ export default function ScheduledTasks(props: Props) {
     const timer = window.setInterval(() => void refreshTasks(), 15_000);
     return () => window.clearInterval(timer);
   }, []);
+
+  useEffect(() => {
+    props.onCountChange(activeTaskCount);
+  }, [activeTaskCount, props.onCountChange]);
 
   function startCreate(): void {
     setSelectedTaskId(null);
@@ -905,7 +917,11 @@ export default function ScheduledTasks(props: Props) {
 
   return (
     <>
-      <section className="scheduled-sidebar" aria-label="Scheduled tasks">
+      <section
+        className="scheduled-sidebar"
+        aria-label="Scheduled tasks"
+        hidden={!props.visible}
+      >
         <header className="scheduled-sidebar-heading">
           <span>
             <Clock3 size={14} />
@@ -999,7 +1015,7 @@ export default function ScheduledTasks(props: Props) {
             setDialog("library");
           }}
         >
-          All tasks
+          View all tasks
           {tasks.filter((task) => task.status === "archived").length
             ? ` · ${tasks.filter((task) => task.status === "archived").length} archived`
             : ""}

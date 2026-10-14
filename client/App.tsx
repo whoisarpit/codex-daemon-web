@@ -18,6 +18,9 @@ import {
   PanelLeftOpen,
   Pencil,
   Plus,
+  Search,
+  Clock3,
+  Settings,
   Shield,
   Square,
   Sun,
@@ -1849,6 +1852,11 @@ export default function App() {
   const [archivedThreads, setArchivedThreads] = useState(false);
   const [threadCursor, setThreadCursor] = useState<string | null>(null);
   const [threadSearch, setThreadSearch] = useState("");
+  const [sidebarSearchOpen, setSidebarSearchOpen] = useState(false);
+  const [sidebarSection, setSidebarSection] = useState<"chats" | "tasks">(
+    "chats",
+  );
+  const [scheduleCount, setScheduleCount] = useState(0);
   const [selectedThread, setSelectedThread] = useState<ThreadSummary | null>(
     null,
   );
@@ -2012,6 +2020,7 @@ export default function App() {
   const [interrupting, setInterrupting] = useState(false);
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const sidebarSearchRef = useRef<HTMLInputElement>(null);
   const [renameId, setRenameId] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState("");
   const threadNameRevisionRef = useRef(0);
@@ -3630,6 +3639,16 @@ export default function App() {
   };
   newConversationRef.current = newConversation;
 
+  const startNewConversationFromSidebar = useCallback(() => {
+    if (archivedThreads) {
+      setArchivedThreads(false);
+      setThreadCursor(null);
+      if (client) void refreshThreads(client, false, false);
+    }
+    setSidebarSection("chats");
+    newConversationRef.current();
+  }, [archivedThreads, client, refreshThreads]);
+
   useEffect(() => {
     const handleLocationChange = () => {
       if (!navigationInitializedRef.current) return;
@@ -3675,12 +3694,17 @@ export default function App() {
     const onShortcut = (event: KeyboardEvent) => {
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
         event.preventDefault();
-        newConversationRef.current();
+        startNewConversationFromSidebar();
+      }
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "f") {
+        event.preventDefault();
+        setSidebarSection("chats");
+        setSidebarSearchOpen(true);
       }
     };
     window.addEventListener("keydown", onShortcut);
     return () => window.removeEventListener("keydown", onShortcut);
-  }, []);
+  }, [startNewConversationFromSidebar]);
 
   const loadOlderItems = async () => {
     if (!client || !selectedThread || !itemCursor) return;
@@ -3758,6 +3782,10 @@ export default function App() {
         .includes(query),
     );
   }, [threadSearch, threads]);
+  useEffect(() => {
+    if (sidebarSearchOpen && sidebarSection === "chats")
+      sidebarSearchRef.current?.focus();
+  }, [sidebarSearchOpen, sidebarSection]);
   const timelineGrouping = useMemo(() => groupTimelineItems(items), [items]);
 
   useEffect(() => {
@@ -5235,87 +5263,123 @@ export default function App() {
       />
       <aside
         className={`sidebar ${mobileSidebarOpen ? "mobile-open" : ""}`}
-        aria-label="Conversation history"
+        aria-label="Sidebar"
       >
-        <div className="sidebar-top">
-          <a
-            className="brand-lockup"
-            href="#home"
-            onClick={(event) => event.preventDefault()}
-          >
-            <span className="brand-mark">
-              <Code2 size={17} strokeWidth={2.2} />
-            </span>
-            <span className="brand-name">
-              Codex <span>Desk</span>
-            </span>
-          </a>
+        <div className="sidebar-top" role="group" aria-label="Sidebar actions">
           <button
             className="icon-button sidebar-hide"
-            aria-label="Collapse sidebar"
-            onClick={() => setSidebarCollapsed(true)}
+            aria-label={
+              mobileSidebarOpen ? "Close sidebar" : "Collapse sidebar"
+            }
+            title={mobileSidebarOpen ? "Close sidebar" : "Collapse sidebar"}
+            onClick={() =>
+              mobileSidebarOpen
+                ? setMobileSidebarOpen(false)
+                : setSidebarCollapsed(true)
+            }
           >
             <PanelLeftClose size={17} />
           </button>
-          <button
-            className="icon-button mobile-close"
-            aria-label="Close history"
-            onClick={() => setMobileSidebarOpen(false)}
-          >
-            <X size={18} />
-          </button>
+          <div className="sidebar-top-actions">
+            <button
+              type="button"
+              className="icon-button sidebar-action"
+              aria-label={
+                sidebarSearchOpen && sidebarSection === "chats"
+                  ? "Close conversation search"
+                  : "Search conversations"
+              }
+              title="Search conversations"
+              aria-pressed={sidebarSearchOpen && sidebarSection === "chats"}
+              onClick={() => {
+                const closeSearch =
+                  sidebarSection === "chats" && sidebarSearchOpen;
+                setSidebarSection("chats");
+                if (closeSearch) {
+                  setThreadSearch("");
+                  setSidebarSearchOpen(false);
+                } else {
+                  setSidebarSearchOpen(true);
+                }
+              }}
+            >
+              <Search size={17} />
+            </button>
+            <button
+              type="button"
+              className={`icon-button sidebar-action ${sidebarSection === "tasks" ? "active" : ""}`}
+              aria-label={`Scheduled tasks${scheduleCount ? `, ${scheduleCount} active or paused` : ""}`}
+              title={`Scheduled tasks${scheduleCount ? ` (${scheduleCount})` : ""}`}
+              aria-pressed={sidebarSection === "tasks"}
+              onClick={() =>
+                setSidebarSection((current) =>
+                  current === "tasks" ? "chats" : "tasks",
+                )
+              }
+            >
+              <Clock3 size={17} />
+              {scheduleCount > 0 ? (
+                <span className="sidebar-count-badge" aria-hidden="true">
+                  {scheduleCount > 99 ? "99+" : scheduleCount}
+                </span>
+              ) : null}
+            </button>
+            <button
+              type="button"
+              className="icon-button sidebar-action"
+              aria-label="New conversation"
+              title="New conversation"
+              onClick={startNewConversationFromSidebar}
+            >
+              <Plus size={18} strokeWidth={2.2} />
+            </button>
+          </div>
         </div>
-
-        <button className="new-chat-button" onClick={() => newConversation()}>
-          <Plus size={16} strokeWidth={2.2} />
-          <span>New conversation</span>
-          <kbd>⌘ K</kbd>
-        </button>
 
         <ScheduledTasks
           currentThread={selectedThread}
           projectCwd={cwd || selectedThread?.cwd || ""}
           models={models}
+          visible={sidebarSection === "tasks"}
+          onCountChange={setScheduleCount}
           onOpenThread={(threadId) => navigateToThread(threadId, [], "push")}
         />
 
-        <div className="history-controls">
-          <button
-            className={`history-tab ${!archivedThreads ? "active" : ""}`}
-            onClick={() => {
-              setArchivedThreads(false);
-              setThreadCursor(null);
-              if (client) void refreshThreads(client, false, false);
-            }}
-          >
-            Recent
-          </button>
-          <button
-            className={`history-tab ${archivedThreads ? "active" : ""}`}
-            onClick={() => {
-              setArchivedThreads(true);
-              setThreadCursor(null);
-              if (client) void refreshThreads(client, true, false);
-            }}
-          >
-            Archived
-          </button>
-        </div>
+        {sidebarSearchOpen && sidebarSection === "chats" ? (
+          <label className="search-box">
+            <span className="sr-only">Search conversations</span>
+            <Search size={14} aria-hidden="true" />
+            <input
+              ref={sidebarSearchRef}
+              value={threadSearch}
+              onChange={(event) => setThreadSearch(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Escape") {
+                  setThreadSearch("");
+                  setSidebarSearchOpen(false);
+                }
+              }}
+              placeholder="Find a conversation"
+            />
+          </label>
+        ) : null}
 
-        <label className="search-box">
-          <span className="sr-only">Search conversations</span>
-          <svg viewBox="0 0 24 24" aria-hidden="true">
-            <circle cx="11" cy="11" r="7" />
-            <path d="m16.5 16.5 4 4" />
-          </svg>
-          <input
-            value={threadSearch}
-            onChange={(event) => setThreadSearch(event.target.value)}
-            placeholder="Find a conversation"
-          />
-        </label>
-
-        <div className="thread-list">
+        <div className="thread-list" hidden={sidebarSection !== "chats"}>
+          {archivedThreads ? (
+            <div className="history-heading">
+              <strong>Archived conversations</strong>
+              <button
+                type="button"
+                onClick={() => {
+                  setArchivedThreads(false);
+                  setThreadCursor(null);
+                  if (client) void refreshThreads(client, false, false);
+                }}
+              >
+                Recent
+              </button>
+            </div>
+          ) : null}
           {filteredThreads.length === 0 ? (
             <div className="thread-list-empty">
               {threadSearch
@@ -5465,18 +5529,29 @@ export default function App() {
             <span className="status-dot" />
             <span>{statusLabel(currentConnection)}</span>
           </div>
-          <button
-            className="profile-button"
-            onClick={() => void signOut()}
-            title="Sign out"
-          >
-            <span className="profile-avatar">C</span>
-            <span className="profile-copy">
-              <strong>Local daemon</strong>
-              <small>Sign out</small>
-            </span>
-            <MoreHorizontal size={17} />
-          </button>
+          <div className="sidebar-footer-row">
+            <button
+              className="profile-button"
+              onClick={() => void signOut()}
+              title="Sign out"
+            >
+              <span className="profile-avatar">C</span>
+              <span className="profile-copy">
+                <strong>Local daemon</strong>
+                <small>Sign out</small>
+              </span>
+              <MoreHorizontal size={17} />
+            </button>
+            <button
+              type="button"
+              className="icon-button sidebar-settings"
+              aria-label="Settings"
+              title="Settings"
+              onClick={() => setShowSettings(true)}
+            >
+              <Settings size={17} />
+            </button>
+          </div>
         </div>
       </aside>
 
@@ -6244,188 +6319,257 @@ export default function App() {
                 )}
               </div>
             </div>
-            {showSettings ? (
-              <div className="settings-panel">
-                <div className="settings-panel-heading">
-                  <div>
-                    <strong>Run settings</strong>
-                    <span>Run choices and browser preferences.</span>
-                  </div>
-                  <button
-                    type="button"
-                    className="icon-button"
-                    aria-label="Close run settings"
+            {showSettings
+              ? createPortal(
+                  <div
+                    className="modal-scrim settings-scrim"
                     onClick={() => setShowSettings(false)}
                   >
-                    <X size={16} />
-                  </button>
-                </div>
-                <div className="settings-grid">
-                  <label>
-                    <span>Model</span>
-                    <select
-                      value={model}
-                      onChange={(event) => selectModel(event.target.value)}
+                    <section
+                      className="settings-panel"
+                      role="dialog"
+                      aria-modal="true"
+                      aria-labelledby="settings-title"
+                      onClick={(event) => event.stopPropagation()}
+                      onKeyDown={(event) => {
+                        if (event.key === "Escape") setShowSettings(false);
+                      }}
                     >
-                      <option value="">Daemon default</option>
-                      {models.map((entry) => (
-                        <option key={entry.id} value={entry.model}>
-                          {entry.displayName || entry.model}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                  <label>
-                    <span>Reasoning</span>
-                    <select
-                      value={effort}
-                      onChange={(event) => setEffort(event.target.value)}
-                    >
-                      <option value="">Daemon default</option>
-                      {availableEfforts.map((option) => (
-                        <option
-                          key={option.reasoningEffort}
-                          value={option.reasoningEffort}
+                      <div className="settings-panel-heading">
+                        <div>
+                          <strong id="settings-title">Settings</strong>
+                          <span>
+                            Run choices, device preferences, and history.
+                          </span>
+                        </div>
+                        <button
+                          type="button"
+                          className="icon-button"
+                          aria-label="Close settings"
+                          autoFocus
+                          onClick={() => setShowSettings(false)}
                         >
-                          {capitalize(option.reasoningEffort)}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                  <label>
-                    <span>Approval policy</span>
-                    <select
-                      value={approvalPolicy}
-                      onChange={(event) =>
-                        setApprovalPolicy(event.target.value)
-                      }
-                    >
-                      <option value="">Keep current policy</option>
-                      <option value="on-request">On request</option>
-                      <option value="untrusted">Untrusted</option>
-                      <option value="never">Never</option>
-                    </select>
-                  </label>
-                  <label>
-                    <span>Sandbox</span>
-                    <select
-                      value={sandboxMode}
-                      onChange={(event) => setSandboxMode(event.target.value)}
-                    >
-                      <option value="">Keep current sandbox</option>
-                      <option value="read-only">Read only · network off</option>
-                      <option value="workspace-write">Workspace write</option>
-                      <option value="danger-full-access">Full access</option>
-                    </select>
-                  </label>
-                  {!selectedThread ? (
-                    <label className="cwd-setting">
-                      <span>Working directory</span>
-                      <input
-                        value={cwd}
-                        onChange={(event) => setCwd(event.target.value)}
-                        placeholder="/path/to/project"
-                        autoCapitalize="off"
-                        autoCorrect="off"
-                        spellCheck={false}
-                      />
-                      <small>Used when this conversation starts.</small>
-                      <small>
-                        Daemon permissions apply unless you choose an override.
-                      </small>
-                    </label>
-                  ) : (
-                    <div className="current-policy">
-                      <span>Current daemon policy</span>
-                      <strong>
-                        {describeApproval(threadDetails?.approvalPolicy)} ·{" "}
-                        {describeSandbox(threadDetails?.sandbox)}
-                      </strong>
-                      {threadDetails?.activePermissionProfile?.id ? (
-                        <small>
-                          Profile: {threadDetails.activePermissionProfile.id}
-                        </small>
-                      ) : (
-                        <small>New choices apply to your next turn.</small>
-                      )}
-                    </div>
-                  )}
-                </div>
-                <div className="settings-preferences">
-                  <div className="settings-preference">
-                    <div>
-                      <strong>Completion sound</strong>
-                      <span>
-                        Play a short tone when a turn finishes in this tab.
-                      </span>
-                    </div>
-                    <button
-                      type="button"
-                      className="settings-toggle"
-                      aria-pressed={completionSoundEnabled}
-                      disabled={typeof window.AudioContext === "undefined"}
-                      onClick={() =>
-                        updateCompletionSound(!completionSoundEnabled)
-                      }
-                    >
-                      {completionSoundEnabled ? "On" : "Off"}
-                    </button>
-                  </div>
-                  <div className="settings-preference">
-                    <div>
-                      <strong>Question notifications</strong>
-                      <span>
-                        {pushSetupState === "unsupported"
-                          ? "This browser does not support push notifications."
-                          : pushSetupState === "loading"
-                            ? "Checking notification support…"
-                            : pushSetupState === "error"
-                              ? `Notification setup needs attention: ${pushError}`
-                              : pushSetupState === "unavailable"
-                                ? "Push notifications are not configured on this server."
-                                : pushSetupState === "denied"
-                                  ? "Notifications are blocked in browser settings. Change site permission to enable them."
-                                  : questionNotificationsEnabled
-                                    ? "This device is subscribed. Keep a chat connected to receive questions."
-                                    : "Get notified when Codex asks a question. New questions won’t be detected after all chats disconnect."}
-                      </span>
-                    </div>
-                    <button
-                      type="button"
-                      className="settings-toggle"
-                      aria-pressed={questionNotificationsEnabled}
-                      disabled={
-                        pushBusy ||
-                        pushSetupState === "loading" ||
-                        (!pushConfiguration && pushSetupState !== "error") ||
-                        (pushConfiguration &&
-                          (!pushConfiguration.ready ||
-                            !pushConfiguration.publicKey) &&
-                          !questionNotificationsEnabled) ||
-                        pushSetupState === "unsupported" ||
-                        (pushSetupState === "denied" &&
-                          !questionNotificationsEnabled)
-                      }
-                      onClick={() =>
-                        questionNotificationsEnabled
-                          ? void disableQuestionNotifications()
-                          : !pushConfiguration
-                            ? void retryQuestionNotificationSetup()
-                            : void enableQuestionNotifications()
-                      }
-                    >
-                      {pushBusy
-                        ? "Saving…"
-                        : !pushConfiguration && pushSetupState === "error"
-                          ? "Retry"
-                          : questionNotificationsEnabled
-                            ? "Turn off"
-                            : "Turn on"}
-                    </button>
-                  </div>
-                </div>
-              </div>
-            ) : null}
+                          <X size={16} />
+                        </button>
+                      </div>
+                      <h3 className="settings-section-title">Run settings</h3>
+                      <div className="settings-grid">
+                        <label>
+                          <span>Model</span>
+                          <select
+                            value={model}
+                            onChange={(event) =>
+                              selectModel(event.target.value)
+                            }
+                          >
+                            <option value="">Daemon default</option>
+                            {models.map((entry) => (
+                              <option key={entry.id} value={entry.model}>
+                                {entry.displayName || entry.model}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                        <label>
+                          <span>Reasoning</span>
+                          <select
+                            value={effort}
+                            onChange={(event) => setEffort(event.target.value)}
+                          >
+                            <option value="">Daemon default</option>
+                            {availableEfforts.map((option) => (
+                              <option
+                                key={option.reasoningEffort}
+                                value={option.reasoningEffort}
+                              >
+                                {capitalize(option.reasoningEffort)}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                        <label>
+                          <span>Approval policy</span>
+                          <select
+                            value={approvalPolicy}
+                            onChange={(event) =>
+                              setApprovalPolicy(event.target.value)
+                            }
+                          >
+                            <option value="">Keep current policy</option>
+                            <option value="on-request">On request</option>
+                            <option value="untrusted">Untrusted</option>
+                            <option value="never">Never</option>
+                          </select>
+                        </label>
+                        <label>
+                          <span>Sandbox</span>
+                          <select
+                            value={sandboxMode}
+                            onChange={(event) =>
+                              setSandboxMode(event.target.value)
+                            }
+                          >
+                            <option value="">Keep current sandbox</option>
+                            <option value="read-only">
+                              Read only · network off
+                            </option>
+                            <option value="workspace-write">
+                              Workspace write
+                            </option>
+                            <option value="danger-full-access">
+                              Full access
+                            </option>
+                          </select>
+                        </label>
+                        {!selectedThread ? (
+                          <label className="cwd-setting">
+                            <span>Working directory</span>
+                            <input
+                              value={cwd}
+                              onChange={(event) => setCwd(event.target.value)}
+                              placeholder="/path/to/project"
+                              autoCapitalize="off"
+                              autoCorrect="off"
+                              spellCheck={false}
+                            />
+                            <small>Used when this conversation starts.</small>
+                            <small>
+                              Daemon permissions apply unless you choose an
+                              override.
+                            </small>
+                          </label>
+                        ) : (
+                          <div className="current-policy">
+                            <span>Current daemon policy</span>
+                            <strong>
+                              {describeApproval(threadDetails?.approvalPolicy)}{" "}
+                              · {describeSandbox(threadDetails?.sandbox)}
+                            </strong>
+                            {threadDetails?.activePermissionProfile?.id ? (
+                              <small>
+                                Profile:{" "}
+                                {threadDetails.activePermissionProfile.id}
+                              </small>
+                            ) : (
+                              <small>
+                                New choices apply to your next turn.
+                              </small>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                      <div className="settings-preferences">
+                        <h3 className="settings-section-title">
+                          Device preferences
+                        </h3>
+                        <div className="settings-preference">
+                          <div>
+                            <strong>Completion sound</strong>
+                            <span>
+                              Play a short tone when a turn finishes in this
+                              tab.
+                            </span>
+                          </div>
+                          <button
+                            type="button"
+                            className="settings-toggle"
+                            aria-pressed={completionSoundEnabled}
+                            disabled={
+                              typeof window.AudioContext === "undefined"
+                            }
+                            onClick={() =>
+                              updateCompletionSound(!completionSoundEnabled)
+                            }
+                          >
+                            {completionSoundEnabled ? "On" : "Off"}
+                          </button>
+                        </div>
+                        <div className="settings-preference">
+                          <div>
+                            <strong>Question notifications</strong>
+                            <span>
+                              {pushSetupState === "unsupported"
+                                ? "This browser does not support push notifications."
+                                : pushSetupState === "loading"
+                                  ? "Checking notification support…"
+                                  : pushSetupState === "error"
+                                    ? `Notification setup needs attention: ${pushError}`
+                                    : pushSetupState === "unavailable"
+                                      ? "Push notifications are not configured on this server."
+                                      : pushSetupState === "denied"
+                                        ? "Notifications are blocked in browser settings. Change site permission to enable them."
+                                        : questionNotificationsEnabled
+                                          ? "This device is subscribed. Keep a chat connected to receive questions."
+                                          : "Get notified when Codex asks a question. New questions won’t be detected after all chats disconnect."}
+                            </span>
+                          </div>
+                          <button
+                            type="button"
+                            className="settings-toggle"
+                            aria-pressed={questionNotificationsEnabled}
+                            disabled={
+                              pushBusy ||
+                              pushSetupState === "loading" ||
+                              (!pushConfiguration &&
+                                pushSetupState !== "error") ||
+                              (pushConfiguration &&
+                                (!pushConfiguration.ready ||
+                                  !pushConfiguration.publicKey) &&
+                                !questionNotificationsEnabled) ||
+                              pushSetupState === "unsupported" ||
+                              (pushSetupState === "denied" &&
+                                !questionNotificationsEnabled)
+                            }
+                            onClick={() =>
+                              questionNotificationsEnabled
+                                ? void disableQuestionNotifications()
+                                : !pushConfiguration
+                                  ? void retryQuestionNotificationSetup()
+                                  : void enableQuestionNotifications()
+                            }
+                          >
+                            {pushBusy
+                              ? "Saving…"
+                              : !pushConfiguration && pushSetupState === "error"
+                                ? "Retry"
+                                : questionNotificationsEnabled
+                                  ? "Turn off"
+                                  : "Turn on"}
+                          </button>
+                        </div>
+                      </div>
+                      <div className="settings-history">
+                        <div>
+                          <strong>Archived conversations</strong>
+                          <span>
+                            View and restore conversations you’ve archived.
+                          </span>
+                        </div>
+                        <button
+                          type="button"
+                          className="settings-history-button"
+                          onClick={() => {
+                            setShowSettings(false);
+                            setArchivedThreads(true);
+                            setThreadCursor(null);
+                            setThreadSearch("");
+                            setSidebarSearchOpen(false);
+                            setSidebarSection("chats");
+                            if (client)
+                              void refreshThreads(client, true, false);
+                            if (window.matchMedia("(max-width: 760px)").matches)
+                              setMobileSidebarOpen(true);
+                          }}
+                        >
+                          Browse archived chats
+                          <ChevronRight size={15} />
+                        </button>
+                      </div>
+                    </section>
+                  </div>,
+                  document.body,
+                )
+              : null}
           </form>
         </div>
       </main>
