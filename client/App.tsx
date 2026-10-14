@@ -43,6 +43,7 @@ import type {
   ApprovalPrompt,
   DaemonStatus,
   ModelOption,
+  QueuedSteerRecovery,
   QueuedSubmission,
   RpcError,
   ThreadDetails,
@@ -577,6 +578,7 @@ function safeElicitationUrl(value: unknown, serverName: string): string | null {
 }
 
 const selectedThreadKey = "codex-desk.selected-thread";
+const queuedSteerRecoveryKey = "codex-daemon-web.queued-steer-recovery";
 const themeChoiceKey = "codex-daemon-web-theme";
 const completionSoundKey = "codex-daemon-web-completion-sound";
 const maxTurnRequestBytes = 900 * 1024;
@@ -584,6 +586,149 @@ const maxAttachmentBytes = 700 * 1024;
 const maxCompressedImageBytes = 320 * 1024;
 const maxImageFileBytes = 20 * 1024 * 1024;
 const maxImageCount = 4;
+
+function readQueuedSteerRecovery(): QueuedSteerRecovery | null {
+  try {
+    const value = JSON.parse(
+      sessionStorage.getItem(queuedSteerRecoveryKey) ?? "null",
+    );
+    if (
+      !isRecord(value) ||
+      typeof value.threadId !== "string" ||
+      !isRecord(value.submission) ||
+      typeof value.submission.id !== "string" ||
+      !Array.isArray(value.submission.input) ||
+      typeof value.submission.clientUserMessageId !== "string" ||
+      typeof value.originalPosition !== "number" ||
+      !Array.isArray(value.originalQueueIds) ||
+      !value.originalQueueIds.every((id) => typeof id === "string") ||
+      !["removing", "steering", "unknown", "restoreFailed"].includes(
+        asString(value.status),
+      )
+    )
+      return null;
+    return value as unknown as QueuedSteerRecovery;
+  } catch {
+    return null;
+  }
+}
+
+async function listThreadQueue(
+  rpc: Pick<RpcClient, "request">,
+  threadId: string,
+): Promise<QueuedSubmission[]> {
+  const submissions: QueuedSubmission[] = [];
+  let cursor: string | null = null;
+  do {
+    const page: {
+      data: QueuedSubmission[];
+      nextCursor: string | null;
+    } = await rpc.request("thread/queue/list", {
+      threadId,
+      limit: 100,
+      ...(cursor ? { cursor } : {}),
+    });
+    submissions.push(...page.data);
+    if (!page.nextCursor || page.nextCursor === cursor) break;
+    cursor = page.nextCursor;
+  } while (true);
+  return [
+    ...new Map(
+      submissions.map((submission) => [submission.id, submission]),
+    ).values(),
+  ];
+}
+
+async function restoreQueuedSubmission(
+  rpc: Pick<RpcClient, "request">,
+  recovery: QueuedSteerRecovery,
+  onAdded: (submission: QueuedSubmission) => void,
+): Promise<{ submission: QueuedSubmission; positionRestored: boolean }> {
+  let submissions = await listThreadQueue(rpc, recovery.threadId);
+  let restored = submissions.find(
+    (submission) =>
+      submission.clientUserMessageId ===
+      recovery.submission.clientUserMessageId,
+  );
+  if (!restored) {
+    const result = await rpc.request<{ queuedSubmission: QueuedSubmission }>(
+      "thread/queue/add",
+      {
+        threadId: recovery.threadId,
+        input: recovery.submission.input,
+        clientUserMessageId: recovery.submission.clientUserMessageId,
+      },
+    );
+    if (!result.queuedSubmission?.id)
+      throw new Error(
+        "The daemon did not confirm that the message was restored.",
+      );
+    restored = result.queuedSubmission;
+    onAdded(restored);
+    submissions = await listThreadQueue(rpc, recovery.threadId);
+  }
+
+  const currentIds = submissions.map((submission) => submission.id);
+  const withoutRestored = currentIds.filter((id) => id !== restored?.id);
+  const originalBefore = recovery.originalQueueIds
+    .slice(0, recovery.originalPosition)
+    .filter((id) => withoutRestored.includes(id));
+  const originalAfter = recovery.originalQueueIds
+    .slice(recovery.originalPosition + 1)
+    .filter((id) => withoutRestored.includes(id));
+  const lastBefore = originalBefore.at(-1);
+  const firstAfter = originalAfter[0];
+  const insertAt = lastBefore
+    ? withoutRestored.indexOf(lastBefore) + 1
+    : firstAfter
+      ? withoutRestored.indexOf(firstAfter)
+      : Math.min(recovery.originalPosition, withoutRestored.length);
+  const orderedIds = [
+    ...withoutRestored.slice(0, insertAt),
+    restored.id,
+    ...withoutRestored.slice(insertAt),
+  ];
+  let positionRestored = true;
+  try {
+    if (orderedIds.some((id, index) => id !== currentIds[index]))
+      await rpc.request("thread/queue/reorder", {
+        threadId: recovery.threadId,
+        queuedSubmissionIds: orderedIds,
+      });
+  } catch {
+    positionRestored = false;
+  }
+  return { submission: restored, positionRestored };
+}
+
+async function threadHasClientMessage(
+  rpc: RpcClient,
+  threadId: string,
+  clientUserMessageId: string,
+  liveItems: TimelineItem[],
+): Promise<boolean> {
+  if (
+    liveItems.some(
+      (entry) =>
+        entry.item.type === "userMessage" &&
+        entry.item.clientId === clientUserMessageId,
+    )
+  )
+    return true;
+  const page = await rpc.request<{
+    data: ThreadItemEntry[];
+    nextCursor: string | null;
+  }>("thread/items/list", {
+    threadId,
+    limit: 100,
+    sortDirection: "desc",
+  });
+  return page.data.some(
+    (entry) =>
+      entry.item.type === "userMessage" &&
+      entry.item.clientId === clientUserMessageId,
+  );
+}
 
 function readThemeChoice(): ThemeChoice {
   try {
@@ -873,13 +1018,26 @@ function ContextUsageIndicator({ usage }: { usage: ThreadTokenUsage | null }) {
 
 function QueuedMessageCard({
   submission,
-  position,
-  total,
+  positionLabel,
+  recovery = false,
+  steerDisabled,
+  steerLabel,
+  steerReason,
+  recoveryNote,
+  onSteer,
+  children,
 }: {
   submission: QueuedSubmission;
-  position: number;
-  total: number;
+  positionLabel?: string;
+  recovery?: boolean;
+  steerDisabled?: boolean;
+  steerLabel?: string;
+  steerReason?: string;
+  recoveryNote?: string;
+  onSteer?: () => void;
+  children?: ReactNode;
 }) {
+  const [previewExpanded, setPreviewExpanded] = useState(false);
   const text = submission.input
     .filter((part) => isRecord(part) && part.type === "text")
     .map((part) => (isRecord(part) ? asString(part.text).trim() : ""))
@@ -892,67 +1050,188 @@ function QueuedMessageCard({
     (part) => isRecord(part) && part.type !== "text" && part.type !== "image",
   );
   const imagePreviews = imageParts
-    .slice(0, 3)
+    .slice(0, 4)
     .map((part) => ("url" in part ? safeImageUrl(part.url) : null));
+  const attachmentLabels = [
+    ...imageParts.map(() => "Image"),
+    ...otherAttachments.map((part) =>
+      isRecord(part) && part.type === "skill"
+        ? `Skill · ${asString(part.name)}`
+        : isRecord(part) && part.type === "mention"
+          ? `Mention · ${asString(part.name)}`
+          : isRecord(part) && part.type === "localImage"
+            ? "Image"
+            : isRecord(part) &&
+                (part.type === "audio" || part.type === "localAudio")
+              ? "Audio"
+              : "Attachment",
+    ),
+  ];
+  const preview =
+    [text, ...attachmentLabels].filter(Boolean).join(" · ") || "Queued message";
 
   return (
-    <article className="queued-message-card">
-      <div className="queued-message-order">
-        {position === 0 ? "Next up" : `${position + 1} of ${total}`}
-      </div>
+    <article
+      className={`queued-message-card ${recovery ? "recovery" : ""} ${previewExpanded ? "preview-expanded" : ""}`}
+    >
+      {positionLabel ? (
+        <div className="queued-message-order">{positionLabel}</div>
+      ) : null}
       <div className="queued-message-content">
-        {text ? <p>{text}</p> : null}
-        {imageParts.length ? (
-          <div className="queued-message-attachments">
-            {imagePreviews.map((url, index) =>
-              url ? (
-                <img
-                  className="queued-message-image"
-                  key={`${submission.id}-image-${index}`}
-                  src={url}
-                  alt="Queued image attachment"
-                />
-              ) : (
-                <span
-                  className="queued-message-attachment"
-                  key={`${submission.id}-image-${index}`}
-                >
-                  Image attachment
-                </span>
-              ),
-            )}
-            {imageParts.length > imagePreviews.length ? (
-              <span className="queued-message-attachment">
-                +{imageParts.length - imagePreviews.length} images
+        {recovery ? (
+          <>
+            {text ? <p>{text}</p> : null}
+            {imageParts.length ? (
+              <div className="queued-message-attachments">
+                {imagePreviews.map((url, index) =>
+                  url ? (
+                    <img
+                      className="queued-message-image"
+                      key={`${submission.id}-image-${index}`}
+                      src={url}
+                      alt="Queued image attachment"
+                    />
+                  ) : (
+                    <span
+                      className="queued-message-attachment"
+                      key={`${submission.id}-image-${index}`}
+                    >
+                      Image attachment
+                    </span>
+                  ),
+                )}
+                {imageParts.length > imagePreviews.length ? (
+                  <span className="queued-message-attachment">
+                    +{imageParts.length - imagePreviews.length} images
+                  </span>
+                ) : null}
+              </div>
+            ) : null}
+            {otherAttachments.length ? (
+              <div className="queued-message-attachments">
+                {otherAttachments.map((part, index) => (
+                  <span
+                    className="queued-message-attachment"
+                    key={`${submission.id}-attachment-${index}`}
+                  >
+                    {isRecord(part) && part.type === "localImage"
+                      ? "Image attachment"
+                      : isRecord(part) &&
+                          (part.type === "audio" || part.type === "localAudio")
+                        ? "Audio attachment"
+                        : isRecord(part) && part.type === "skill"
+                          ? `Skill · ${asString(part.name)}`
+                          : isRecord(part) && part.type === "mention"
+                            ? `Mention · ${asString(part.name)}`
+                            : "Attachment"}
+                  </span>
+                ))}
+              </div>
+            ) : null}
+            {!text && !imageParts.length && !otherAttachments.length ? (
+              <p>Queued message</p>
+            ) : null}
+          </>
+        ) : (
+          <button
+            type="button"
+            className="queued-message-preview"
+            aria-expanded={previewExpanded}
+            aria-controls={`queued-message-details-${submission.id}`}
+            title={preview}
+            onClick={() => setPreviewExpanded((current) => !current)}
+          >
+            <span className="queued-message-preview-text">
+              {text || "Queued message"}
+            </span>
+            {attachmentLabels.length ? (
+              <span className="queued-message-preview-attachments">
+                {attachmentLabels.join(" · ")}
               </span>
+            ) : null}
+          </button>
+        )}
+        {!recovery ? (
+          <div
+            id={`queued-message-details-${submission.id}`}
+            className="queued-message-preview-details"
+            aria-hidden={!previewExpanded}
+          >
+            {text ? <p>{text}</p> : null}
+            {imageParts.length ? (
+              <div className="queued-message-preview-images">
+                {imagePreviews.map((url, index) =>
+                  url ? (
+                    <img
+                      key={`${submission.id}-preview-image-${index}`}
+                      src={url}
+                      alt={`Queued image ${index + 1}`}
+                    />
+                  ) : (
+                    <span
+                      className="queued-message-attachment"
+                      key={`${submission.id}-preview-image-${index}`}
+                    >
+                      Image attachment
+                    </span>
+                  ),
+                )}
+                {imageParts.length > imagePreviews.length ? (
+                  <span className="queued-message-attachment">
+                    +{imageParts.length - imagePreviews.length} images
+                  </span>
+                ) : null}
+              </div>
+            ) : null}
+            {otherAttachments.length ? (
+              <div className="queued-message-preview-labels">
+                {attachmentLabels
+                  .slice(imageParts.length)
+                  .map((label, index) => (
+                    <span
+                      className="queued-message-attachment"
+                      key={`${submission.id}-preview-attachment-${index}`}
+                    >
+                      {label}
+                    </span>
+                  ))}
+              </div>
+            ) : null}
+            {!text && !imageParts.length && !otherAttachments.length ? (
+              <p>Queued message</p>
             ) : null}
           </div>
         ) : null}
-        {otherAttachments.length ? (
-          <div className="queued-message-attachments">
-            {otherAttachments.map((part, index) => (
-              <span
-                className="queued-message-attachment"
-                key={`${submission.id}-attachment-${index}`}
-              >
-                {isRecord(part) && part.type === "localImage"
-                  ? "Image attachment"
-                  : isRecord(part) &&
-                      (part.type === "audio" || part.type === "localAudio")
-                    ? "Audio attachment"
-                    : isRecord(part) && part.type === "skill"
-                      ? `Skill · ${asString(part.name)}`
-                      : isRecord(part) && part.type === "mention"
-                        ? `Mention · ${asString(part.name)}`
-                        : "Attachment"}
-              </span>
-            ))}
-          </div>
-        ) : null}
-        {!text && !imageParts.length && !otherAttachments.length ? (
-          <p>Queued message</p>
-        ) : null}
       </div>
+      {recoveryNote ? (
+        <p className="queued-message-recovery-note">{recoveryNote}</p>
+      ) : null}
+      {onSteer || children ? (
+        <div className="queued-message-card-actions">
+          {children}
+          {onSteer ? (
+            <button
+              type="button"
+              className="queued-message-steer"
+              disabled={steerDisabled}
+              title={
+                steerDisabled ? steerReason : "Steer this queued message now"
+              }
+              aria-label={
+                steerDisabled && steerReason
+                  ? `Steer now unavailable. ${steerReason}`
+                  : "Steer now"
+              }
+              aria-describedby={
+                steerDisabled ? "queue-steer-unavailable-reason" : undefined
+              }
+              onClick={onSteer}
+            >
+              {steerLabel ?? "Steer"}
+            </button>
+          ) : null}
+        </div>
+      ) : null}
     </article>
   );
 }
@@ -964,6 +1243,14 @@ function QueuedMessageStack({
   onRetry,
   loading,
   error,
+  canSteer,
+  steeringSubmissionId,
+  steerUnavailableReason,
+  onSteer,
+  recovery,
+  onCheckRecovery,
+  onRestoreRecovery,
+  recoveryBusy,
 }: {
   submissions: QueuedSubmission[];
   expanded: boolean;
@@ -971,14 +1258,22 @@ function QueuedMessageStack({
   onRetry: () => void;
   loading: boolean;
   error: string;
+  canSteer: boolean;
+  steeringSubmissionId: string | null;
+  steerUnavailableReason: string;
+  onSteer: (submission: QueuedSubmission) => void;
+  recovery: QueuedSteerRecovery | null;
+  onCheckRecovery: () => void;
+  onRestoreRecovery: (allowUnknown?: boolean) => void;
+  recoveryBusy: boolean;
 }) {
-  if (loading && !submissions.length)
+  if (loading && !submissions.length && !recovery)
     return (
       <div className="queued-message-state" role="status">
         Checking queued messages…
       </div>
     );
-  if (error && !submissions.length)
+  if (error && !submissions.length && !recovery)
     return (
       <div className="queued-message-state error" role="status">
         <span>Queued messages could not be loaded.</span>
@@ -987,39 +1282,112 @@ function QueuedMessageStack({
         </button>
       </div>
     );
-  if (!submissions.length) return null;
+  if (!submissions.length && !recovery) return null;
 
   const visibleSubmissions = expanded ? submissions : submissions.slice(0, 1);
   const stacked = !expanded && submissions.length > 1;
+  const recoveryUnknown =
+    recovery?.status === "unknown" ||
+    recovery?.status === "steering" ||
+    recovery?.status === "removing";
+  const recoveryMessage = recoveryUnknown
+    ? "Queue state is uncertain. Check the conversation before restoring; the message may already have started."
+    : recovery?.status === "restoreFailed"
+      ? "The message could not be fully restored. Its saved input is kept here."
+      : "The saved message was removed from the queue. Check its status before taking another action.";
+  const hiddenRecoveryId =
+    recovery?.restoredSubmissionId ?? recovery?.submission.id;
+  const shownSubmissions = visibleSubmissions.filter(
+    (submission) => submission.id !== hiddenRecoveryId,
+  );
 
   return (
     <section
       className="queued-message-stack"
-      aria-label={`${submissions.length} queued messages`}
+      aria-label={`${submissions.length} queued messages${recovery ? " and queue recovery" : ""}`}
     >
-      <div className="queued-message-heading">
-        <div>
-          <span>Queued</span>
-          <span className="queued-message-count">{submissions.length}</span>
-        </div>
-        {submissions.length > 1 ? (
-          <button type="button" aria-expanded={expanded} onClick={onToggle}>
-            {expanded ? "Show less" : `Show ${submissions.length - 1} more`}
-          </button>
-        ) : null}
-      </div>
       <div
         className={`queued-message-cards ${stacked ? "stacked" : ""} ${expanded ? "expanded" : ""}`}
       >
-        {visibleSubmissions.map((submission, position) => (
+        {shownSubmissions.map((submission, position) => (
           <QueuedMessageCard
             key={submission.id}
             submission={submission}
-            position={position}
-            total={submissions.length}
+            steerDisabled={
+              !canSteer || steeringSubmissionId !== null || Boolean(recovery)
+            }
+            steerLabel={
+              steeringSubmissionId === submission.id ? "Working…" : "Steer"
+            }
+            steerReason={steerUnavailableReason}
+            onSteer={() => onSteer(submission)}
+            children={
+              position === 0 && submissions.length > 1 ? (
+                <button
+                  type="button"
+                  className="queued-message-expand"
+                  aria-expanded={expanded}
+                  title={
+                    expanded
+                      ? "Show fewer queued messages"
+                      : `Show ${submissions.length - 1} more queued messages`
+                  }
+                  onClick={onToggle}
+                >
+                  {expanded ? "Less" : `+${submissions.length - 1}`}
+                </button>
+              ) : undefined
+            }
           />
         ))}
       </div>
+      {recovery ? (
+        <div className="queued-message-recovery">
+          <QueuedMessageCard
+            key={`recovery-${recovery.submission.id}`}
+            submission={recovery.submission}
+            positionLabel="Saved for recovery"
+            recovery
+            recoveryNote={recoveryMessage}
+          >
+            {recovery.status === "restoreFailed" ? (
+              <button
+                type="button"
+                disabled={recoveryBusy}
+                onClick={() => onRestoreRecovery(false)}
+              >
+                Retry restore
+              </button>
+            ) : (
+              <button
+                type="button"
+                disabled={recoveryBusy}
+                onClick={onCheckRecovery}
+              >
+                Check status
+              </button>
+            )}
+            {recoveryUnknown ? (
+              <button
+                type="button"
+                disabled={recoveryBusy}
+                onClick={() => onRestoreRecovery(true)}
+              >
+                Restore anyway
+              </button>
+            ) : null}
+          </QueuedMessageCard>
+        </div>
+      ) : null}
+      {submissions.length && !canSteer ? (
+        <div
+          id="queue-steer-unavailable-reason"
+          className="queued-message-refresh-error"
+          role="status"
+        >
+          {steerUnavailableReason}
+        </div>
+      ) : null}
       {error ? (
         <div className="queued-message-refresh-error" role="status">
           The queue may be out of date.
@@ -1393,6 +1761,13 @@ export default function App() {
   const [queueLoading, setQueueLoading] = useState(false);
   const [queueError, setQueueError] = useState("");
   const [queueExpanded, setQueueExpanded] = useState(false);
+  const [steeringSubmissionId, setSteeringSubmissionId] = useState<
+    string | null
+  >(null);
+  const queueSteerInFlightRef = useRef(false);
+  const [queueSteerRecovery, setQueueSteerRecovery] =
+    useState<QueuedSteerRecovery | null>(readQueuedSteerRecovery);
+  const queueSteerRecoveryRef = useRef(queueSteerRecovery);
   const [threadDetails, setThreadDetails] = useState<ThreadDetails | null>(
     null,
   );
@@ -1456,6 +1831,11 @@ export default function App() {
   const [loadingThread, setLoadingThread] = useState(false);
   const [activeTurnId, setActiveTurnId] = useState<string | null>(null);
   const [turnActive, setTurnActive] = useState(false);
+  const activeTurnSnapshotRef = useRef<{
+    threadId: string | null;
+    turnId: string | null;
+    active: boolean;
+  }>({ threadId: null, turnId: null, active: false });
   const [models, setModels] = useState<ModelOption[]>([]);
   const [model, setModel] = useState("");
   const [effort, setEffort] = useState("");
@@ -1571,6 +1951,7 @@ export default function App() {
   const sessionProbeInFlightRef = useRef<number | null>(null);
   const sessionProbeLastAtRef = useRef(0);
   const approvalPrompt = approvalQueue[0] ?? null;
+  const observedSteerClientIdRef = useRef<string | null>(null);
   const updateCheckRef = useRef<(() => void) | null>(null);
   const newConversationRef = useRef<
     (historyMode?: "push" | "replace" | "none") => void
@@ -1579,6 +1960,46 @@ export default function App() {
   useEffect(() => {
     completionSoundEnabledRef.current = completionSoundEnabled;
   }, [completionSoundEnabled]);
+
+  useEffect(() => {
+    queueSteerRecoveryRef.current = queueSteerRecovery;
+  }, [queueSteerRecovery]);
+
+  useEffect(() => {
+    activeTurnSnapshotRef.current = {
+      threadId: selectedThread?.id ?? null,
+      turnId: activeTurnId,
+      active: turnActive,
+    };
+  }, [activeTurnId, selectedThread?.id, turnActive]);
+
+  const saveQueueSteerRecovery = useCallback(
+    (recovery: QueuedSteerRecovery | null) => {
+      if (recovery) {
+        try {
+          sessionStorage.setItem(
+            queuedSteerRecoveryKey,
+            JSON.stringify(recovery),
+          );
+        } catch {
+          return false;
+        }
+      } else {
+        queueSteerRecoveryRef.current = null;
+        setQueueSteerRecovery(null);
+        try {
+          sessionStorage.removeItem(queuedSteerRecoveryKey);
+        } catch {
+          return false;
+        }
+        return true;
+      }
+      queueSteerRecoveryRef.current = recovery;
+      setQueueSteerRecovery(recovery);
+      return true;
+    },
+    [],
+  );
 
   useEffect(() => {
     if (!completionSoundEnabled || typeof window.AudioContext === "undefined")
@@ -1884,6 +2305,11 @@ export default function App() {
     setLoadingThread(false);
     setActiveTurnId(null);
     setTurnActive(false);
+    activeTurnSnapshotRef.current = {
+      threadId: null,
+      turnId: null,
+      active: false,
+    };
     setModels([]);
     setModel("");
     setEffort("");
@@ -2062,34 +2488,15 @@ export default function App() {
   const refreshThreadQueue = useCallback(
     async (rpc: RpcClient, threadId: string) => {
       const version = ++queueLoadVersionRef.current;
-      const submissions: QueuedSubmission[] = [];
-      let cursor: string | null = null;
       try {
-        do {
-          const page: {
-            data: QueuedSubmission[];
-            nextCursor: string | null;
-          } = await rpc.request("thread/queue/list", {
-            threadId,
-            limit: 100,
-            ...(cursor ? { cursor } : {}),
-          });
-          submissions.push(...page.data);
-          if (!page.nextCursor || page.nextCursor === cursor) break;
-          cursor = page.nextCursor;
-        } while (true);
+        const submissions = await listThreadQueue(rpc, threadId);
         if (
           version !== queueLoadVersionRef.current ||
           selectedRef.current !== threadId
         )
           return;
-        const uniqueSubmissions = [
-          ...new Map(
-            submissions.map((submission) => [submission.id, submission]),
-          ).values(),
-        ];
         setQueueThreadId(threadId);
-        setQueuedSubmissions(uniqueSubmissions);
+        setQueuedSubmissions(submissions);
         setQueueError("");
       } catch (error) {
         if (
@@ -2184,6 +2591,12 @@ export default function App() {
       if (method === "turn/started" && isRecord(params.turn)) {
         const startedTurnId = asString(params.turn.id);
         if (startedTurnId)
+          activeTurnSnapshotRef.current = {
+            threadId: asString(params.threadId) || selectedRef.current,
+            turnId: startedTurnId,
+            active: true,
+          };
+        if (startedTurnId)
           eligibleCompletionTurnIdsRef.current.add(startedTurnId);
       }
       if (method === "turn/completed" && isRecord(params.turn)) {
@@ -2222,6 +2635,15 @@ export default function App() {
         const turn = params.turn;
         const completedTurnId = asString(turn.id);
         if (!activeTurnId || completedTurnId === activeTurnId) {
+          if (
+            activeTurnSnapshotRef.current.threadId === threadId &&
+            activeTurnSnapshotRef.current.turnId === completedTurnId
+          )
+            activeTurnSnapshotRef.current = {
+              threadId,
+              turnId: null,
+              active: false,
+            };
           setTurnActive(false);
           setActiveTurnId(null);
         }
@@ -2230,6 +2652,11 @@ export default function App() {
       if (method === "thread/status/changed") {
         const status = params.status;
         const isActive = isRecord(status) && status.type === "active";
+        activeTurnSnapshotRef.current = {
+          threadId,
+          turnId: isActive ? activeTurnSnapshotRef.current.turnId : null,
+          active: isActive,
+        };
         setTurnActive(isActive);
         if (!isActive) setActiveTurnId(null);
         return;
@@ -2239,6 +2666,24 @@ export default function App() {
         if (!isRecord(params.item) || typeof params.item.type !== "string")
           return;
         const next = params.item as ThreadItem;
+        if (
+          method === "item/started" &&
+          next.type === "userMessage" &&
+          typeof next.clientId === "string"
+        ) {
+          const recovery = queueSteerRecoveryRef.current;
+          if (
+            recovery?.threadId === threadId &&
+            recovery.submission.clientUserMessageId === next.clientId
+          ) {
+            observedSteerClientIdRef.current = next.clientId;
+            saveQueueSteerRecovery(null);
+            setNotice({
+              tone: "success",
+              text: "This saved queued message has already started in the conversation.",
+            });
+          }
+        }
         liveItemsRef.current.add(next.id);
         const turnId = asString(params.turnId);
         setItems((current) => {
@@ -2357,7 +2802,14 @@ export default function App() {
         return;
       }
     },
-    [activeTurnId, archivedThreads, client, refreshThreadQueue, refreshThreads],
+    [
+      activeTurnId,
+      archivedThreads,
+      client,
+      refreshThreadQueue,
+      refreshThreads,
+      saveQueueSteerRecovery,
+    ],
   );
 
   const handleServerRequest = useCallback((request: ApprovalPrompt) => {
@@ -2398,6 +2850,11 @@ export default function App() {
       setLoadingThread(true);
       setItemCursor(null);
       setActiveTurnId(null);
+      activeTurnSnapshotRef.current = {
+        threadId,
+        turnId: null,
+        active: false,
+      };
       liveItemsRef.current.clear();
       try {
         const response = await rpc.request<
@@ -2427,6 +2884,13 @@ export default function App() {
           isRecord(response.thread.status) &&
             response.thread.status.type === "active",
         );
+        activeTurnSnapshotRef.current = {
+          threadId,
+          turnId: null,
+          active:
+            isRecord(response.thread.status) &&
+            response.thread.status.type === "active",
+        };
         if (response.thread.canAcceptDirectInput === false)
           setShowSettings(false);
         setSelectedThread((current) => {
@@ -2534,6 +2998,11 @@ export default function App() {
         if (activeTurn) {
           eligibleCompletionTurnIdsRef.current.add(activeTurn.id);
           setActiveTurnId(activeTurn.id);
+          activeTurnSnapshotRef.current = {
+            threadId,
+            turnId: activeTurn.id,
+            active: true,
+          };
         }
         setLoadingThread(false);
         sessionStorage.setItem(selectedThreadKey, threadId);
@@ -2596,6 +3065,11 @@ export default function App() {
       setLoadingThread(true);
       setActiveTurnId(null);
       setTurnActive(false);
+      activeTurnSnapshotRef.current = {
+        threadId: null,
+        turnId: null,
+        active: false,
+      };
       return undefined;
     },
     [
@@ -2938,6 +3412,11 @@ export default function App() {
     setLoadingThread(false);
     setActiveTurnId(null);
     setTurnActive(false);
+    activeTurnSnapshotRef.current = {
+      threadId: null,
+      turnId: null,
+      active: false,
+    };
     setApprovalPolicy("");
     setSandboxMode("");
     setCwd(selectedThread?.cwd || threadDetails?.cwd || "");
@@ -3074,6 +3553,7 @@ export default function App() {
     !loadingThread &&
     !sending &&
     !queueing &&
+    !steeringSubmissionId &&
     selectedThread?.canAcceptDirectInput !== false;
   const filteredThreads = useMemo(() => {
     const query = threadSearch.toLowerCase().trim();
@@ -3310,6 +3790,7 @@ export default function App() {
     if (
       sending ||
       queueingRef.current ||
+      queueSteerInFlightRef.current ||
       compressingUploadsRef.current ||
       (!composer.trim() && uploads.length === 0) ||
       !client ||
@@ -3507,6 +3988,11 @@ export default function App() {
           eligibleCompletionTurnIdsRef.current.add(response.turn.id);
         setActiveTurnId(response.turn.id);
         setTurnActive(response.turn.status === "inProgress");
+        activeTurnSnapshotRef.current = {
+          threadId,
+          turnId: response.turn.id,
+          active: response.turn.status === "inProgress",
+        };
         if ((composerRef.current?.value ?? composerAtSend) === composerAtSend) {
           setComposer("");
           if (composerRef.current) composerRef.current.style.height = "39px";
@@ -3527,7 +4013,13 @@ export default function App() {
   };
 
   const queueMessage = async () => {
-    if (queueingRef.current || sending || compressingUploadsRef.current) return;
+    if (
+      queueingRef.current ||
+      queueSteerInFlightRef.current ||
+      sending ||
+      compressingUploadsRef.current
+    )
+      return;
     if (selectedThread?.canAcceptDirectInput === false) return;
     if (
       !client ||
@@ -3635,6 +4127,310 @@ export default function App() {
     } finally {
       queueingRef.current = false;
       setQueueing(false);
+    }
+  };
+
+  const reconcileQueueSteerRecovery = async (lockHeld = false) => {
+    const recovery = queueSteerRecoveryRef.current;
+    if (!client || !recovery || recovery.threadId !== selectedRef.current)
+      return;
+    if (queueSteerInFlightRef.current && !lockHeld) return;
+    if (!lockHeld) {
+      queueSteerInFlightRef.current = true;
+      setSteeringSubmissionId(recovery.submission.id);
+    }
+    try {
+      const submissions = await listThreadQueue(client, recovery.threadId);
+      if (
+        submissions.some(
+          (submission) =>
+            submission.id === recovery.submission.id ||
+            submission.clientUserMessageId ===
+              recovery.submission.clientUserMessageId,
+        )
+      ) {
+        saveQueueSteerRecovery(null);
+        setNotice({
+          tone: "info",
+          text: "The message is still queued. No steer was sent.",
+        });
+        void refreshThreadQueue(client, recovery.threadId);
+        return;
+      }
+      if (
+        observedSteerClientIdRef.current ===
+          recovery.submission.clientUserMessageId ||
+        (await threadHasClientMessage(
+          client,
+          recovery.threadId,
+          recovery.submission.clientUserMessageId,
+          itemsRef.current,
+        ))
+      ) {
+        saveQueueSteerRecovery(null);
+        setNotice({
+          tone: "success",
+          text: "The saved message has already started in the conversation.",
+        });
+        void refreshThreadQueue(client, recovery.threadId);
+        return;
+      }
+      saveQueueSteerRecovery({ ...recovery, status: "unknown" });
+      setNotice({
+        tone: "info",
+        text: "The saved message is absent from the queue and recent history. Review the conversation before restoring it.",
+      });
+      void refreshThreadQueue(client, recovery.threadId);
+    } catch (error) {
+      setNotice({
+        tone: "error",
+        text: `Could not verify the saved message. It remains available for recovery. ${shortError(error)}`,
+      });
+    } finally {
+      if (!lockHeld) {
+        queueSteerInFlightRef.current = false;
+        setSteeringSubmissionId(null);
+      }
+    }
+  };
+
+  const restoreQueueSteerRecovery = async (
+    allowUnknown = false,
+    lockHeld = false,
+  ) => {
+    const recovery = queueSteerRecoveryRef.current;
+    if (!client || !recovery || recovery.threadId !== selectedRef.current)
+      return false;
+    if (
+      allowUnknown &&
+      !window.confirm(
+        "This queued message may already have been steered. Restoring it could make Codex receive it twice. Restore it anyway?",
+      )
+    )
+      return false;
+    if (queueSteerInFlightRef.current && !lockHeld) return false;
+    if (!lockHeld) queueSteerInFlightRef.current = true;
+    setSteeringSubmissionId(recovery.submission.id);
+    const restoring = { ...recovery };
+    saveQueueSteerRecovery(restoring);
+    try {
+      const { positionRestored } = await restoreQueuedSubmission(
+        client,
+        recovery,
+        (restored) =>
+          saveQueueSteerRecovery({
+            ...restoring,
+            restoredSubmissionId: restored.id,
+          }),
+      );
+      saveQueueSteerRecovery(null);
+      void refreshThreadQueue(client, recovery.threadId);
+      setNotice({
+        tone: positionRestored ? "success" : "info",
+        text: positionRestored
+          ? "The queued message was restored in its original position."
+          : "The queued message was restored, but its original position could not be confirmed because the queue changed.",
+      });
+      return true;
+    } catch (error) {
+      saveQueueSteerRecovery({
+        ...restoring,
+        status:
+          recovery.status === "restoreFailed" ? "restoreFailed" : "unknown",
+        ...(recovery.restoredSubmissionId
+          ? { restoredSubmissionId: recovery.restoredSubmissionId }
+          : {}),
+      });
+      setNotice({
+        tone: "error",
+        text: `Could not restore the queued message. Its saved input is still available here. ${shortError(error)}`,
+      });
+      void refreshThreadQueue(client, recovery.threadId);
+      return false;
+    } finally {
+      if (!lockHeld) {
+        queueSteerInFlightRef.current = false;
+        setSteeringSubmissionId(null);
+      }
+    }
+  };
+
+  const steerQueuedSubmission = async (submission: QueuedSubmission) => {
+    if (
+      queueSteerInFlightRef.current ||
+      !client ||
+      connection !== "online" ||
+      !selectedThread ||
+      selectedThread.canAcceptDirectInput === false ||
+      loadingThread ||
+      selectedRef.current !== selectedThread.id ||
+      queueThreadId !== selectedThread.id ||
+      queueLoading ||
+      queueError ||
+      !turnActive ||
+      !activeTurnId ||
+      !submission.clientUserMessageId
+    )
+      return;
+    if (queueSteerRecoveryRef.current) {
+      setNotice({
+        tone: "info",
+        text: "Resolve the saved queue recovery before steering another message.",
+      });
+      return;
+    }
+    const originalPosition = queuedSubmissions.findIndex(
+      (entry) => entry.id === submission.id,
+    );
+    if (originalPosition < 0) {
+      setNotice({
+        tone: "info",
+        text: "That queued message is no longer in the current queue. Refresh the queue and try again.",
+      });
+      void refreshThreadQueue(client, selectedThread.id);
+      return;
+    }
+    const snapshot = activeTurnSnapshotRef.current;
+    if (
+      snapshot.threadId !== selectedThread.id ||
+      !snapshot.active ||
+      !snapshot.turnId
+    ) {
+      setNotice({
+        tone: "info",
+        text: "There is no active turn to steer. The message remains queued.",
+      });
+      return;
+    }
+    const steerParams = {
+      threadId: selectedThread.id,
+      expectedTurnId: snapshot.turnId,
+      clientUserMessageId: submission.clientUserMessageId,
+      input: submission.input,
+    };
+    const requestBytes = serializedRequestBytes("turn/steer", steerParams);
+    if (requestBytes > maxTurnRequestBytes) {
+      setNotice({
+        tone: "error",
+        text: `This queued message is too large to steer (${Math.ceil(requestBytes / 1024)} KB; limit ${Math.floor(maxTurnRequestBytes / 1024)} KB). It remains in the queue.`,
+      });
+      return;
+    }
+
+    const recovery: QueuedSteerRecovery = {
+      threadId: selectedThread.id,
+      submission,
+      originalPosition,
+      originalQueueIds: queuedSubmissions.map((entry) => entry.id),
+      status: "removing",
+    };
+    if (!saveQueueSteerRecovery(recovery)) {
+      setNotice({
+        tone: "error",
+        text: "Could not save a local recovery copy, so the queued message was left unchanged.",
+      });
+      return;
+    }
+    observedSteerClientIdRef.current = null;
+    queueSteerInFlightRef.current = true;
+    setSteeringSubmissionId(submission.id);
+    setNotice(null);
+    try {
+      const deleted = await client.request<{ deleted: boolean }>(
+        "thread/queue/delete",
+        {
+          threadId: recovery.threadId,
+          queuedSubmissionId: submission.id,
+        },
+      );
+      if (!deleted.deleted) {
+        saveQueueSteerRecovery({ ...recovery, status: "unknown" });
+        await reconcileQueueSteerRecovery(true);
+        return;
+      }
+      saveQueueSteerRecovery({ ...recovery, status: "steering" });
+      const currentTurn = activeTurnSnapshotRef.current;
+      if (
+        selectedRef.current !== recovery.threadId ||
+        currentTurn.threadId !== recovery.threadId ||
+        currentTurn.turnId !== snapshot.turnId ||
+        !currentTurn.active
+      ) {
+        const restoreRecord = { ...recovery, status: "restoreFailed" as const };
+        saveQueueSteerRecovery(restoreRecord);
+        await restoreQueueSteerRecovery(false, true);
+        return;
+      }
+      try {
+        const result = await client.request<{ turnId: string }>(
+          "turn/steer",
+          steerParams,
+        );
+        if (!result.turnId)
+          throw new Error("The daemon did not confirm the steer target turn.");
+        saveQueueSteerRecovery(null);
+        void refreshThreadQueue(client, recovery.threadId);
+        void refreshThreads(client, archivedThreads, false);
+        setNotice({
+          tone: "success",
+          text:
+            result.turnId === snapshot.turnId
+              ? "The queued message was steered into the active turn."
+              : "The queued message was accepted by an active turn with a different ID.",
+        });
+      } catch (error) {
+        const alreadyObserved =
+          observedSteerClientIdRef.current === submission.clientUserMessageId;
+        const alreadyInHistory = alreadyObserved
+          ? true
+          : await threadHasClientMessage(
+              client,
+              recovery.threadId,
+              submission.clientUserMessageId,
+              itemsRef.current,
+            ).catch(() => false);
+        if (alreadyInHistory) {
+          saveQueueSteerRecovery(null);
+          setNotice({
+            tone: "success",
+            text: "The queued message appeared in the conversation despite the interrupted response.",
+          });
+          return;
+        }
+        if (isRecord(error) && typeof error.code === "number") {
+          saveQueueSteerRecovery({ ...recovery, status: "restoreFailed" });
+          const restored = await restoreQueueSteerRecovery(false, true);
+          if (restored)
+            setNotice({
+              tone: "error",
+              text: `Codex rejected the steer. The queued message was restored. ${shortError(error)}`,
+            });
+          return;
+        }
+        saveQueueSteerRecovery({ ...recovery, status: "unknown" });
+        setNotice({
+          tone: "error",
+          text: `Could not confirm whether the steer was accepted. The saved message was not requeued to avoid a duplicate. Check status before restoring it. ${shortError(error)}`,
+        });
+      }
+    } catch (error) {
+      if (isRecord(error) && typeof error.code === "number") {
+        saveQueueSteerRecovery(null);
+        setNotice({
+          tone: "error",
+          text: `Codex rejected removing the queued message; no steer was sent. ${shortError(error)}`,
+        });
+      } else {
+        saveQueueSteerRecovery({ ...recovery, status: "unknown" });
+        setNotice({
+          tone: "error",
+          text: `Could not confirm removal from the queue. No steer was sent. Check status before retrying. ${shortError(error)}`,
+        });
+      }
+      void refreshThreadQueue(client, recovery.threadId);
+    } finally {
+      queueSteerInFlightRef.current = false;
+      setSteeringSubmissionId(null);
     }
   };
 
@@ -4036,7 +4832,40 @@ export default function App() {
     !compressingUploads &&
     selectedRef.current === (selectedThread?.id ?? null) &&
     hasComposerContent &&
+    !steeringSubmissionId &&
     Boolean(selectedThread && turnActive && activeTurnId);
+  const selectedQueueRecovery =
+    queueSteerRecovery?.threadId === selectedThread?.id
+      ? queueSteerRecovery
+      : null;
+  const canSteerQueuedMessage = Boolean(
+    connection === "online" &&
+    selectedThread &&
+    selectedThread.canAcceptDirectInput !== false &&
+    !loadingThread &&
+    selectedRef.current === selectedThread.id &&
+    queueThreadId === selectedThread.id &&
+    !queueLoading &&
+    !queueError &&
+    turnActive &&
+    activeTurnId &&
+    !steeringSubmissionId &&
+    !queueSteerRecovery,
+  );
+  const queueSteerUnavailableReason =
+    selectedThread?.canAcceptDirectInput === false
+      ? "This agent is controlled by its parent."
+      : connection !== "online"
+        ? "Reconnect before steering a queued message."
+        : loadingThread
+          ? "Wait for the conversation to finish loading."
+          : queueLoading || queueError
+            ? "Refresh the queue before steering a saved message."
+            : !turnActive || !activeTurnId
+              ? "Steer now is available only while this thread has an active turn."
+              : queueSteerRecovery
+                ? "Resolve the saved queue recovery before steering another message."
+                : "Steer now is unavailable for this thread.";
 
   return (
     <div className={`app-shell ${sidebarCollapsed ? "sidebar-collapsed" : ""}`}>
@@ -4554,9 +5383,33 @@ export default function App() {
         </div>
 
         <div className="composer-wrap">
-          {selectedThread && queueThreadId === selectedThread.id ? (
+          {queueSteerRecovery &&
+          queueSteerRecovery.threadId !== selectedThread?.id ? (
+            <div className="queued-message-state error" role="status">
+              <span>
+                A saved queue recovery is waiting in another conversation.
+                Resolve it there before steering another message.
+              </span>
+              <button
+                type="button"
+                onClick={() => {
+                  void navigateToThread(
+                    queueSteerRecovery.threadId,
+                    [],
+                    "push",
+                  );
+                }}
+              >
+                Open conversation
+              </button>
+            </div>
+          ) : null}
+          {selectedThread &&
+          (queueThreadId === selectedThread.id || selectedQueueRecovery) ? (
             <QueuedMessageStack
-              submissions={queuedSubmissions}
+              submissions={
+                queueThreadId === selectedThread.id ? queuedSubmissions : []
+              }
               expanded={queueExpanded}
               onToggle={() => setQueueExpanded((current) => !current)}
               onRetry={() => {
@@ -4568,6 +5421,16 @@ export default function App() {
               }}
               loading={queueLoading}
               error={queueError}
+              canSteer={canSteerQueuedMessage}
+              steeringSubmissionId={steeringSubmissionId}
+              steerUnavailableReason={queueSteerUnavailableReason}
+              onSteer={(submission) => void steerQueuedSubmission(submission)}
+              recovery={selectedQueueRecovery}
+              onCheckRecovery={() => void reconcileQueueSteerRecovery()}
+              onRestoreRecovery={(allowUnknown) =>
+                void restoreQueueSteerRecovery(allowUnknown)
+              }
+              recoveryBusy={steeringSubmissionId !== null}
             />
           ) : null}
           <form className="composer-card" onSubmit={sendMessage}>
@@ -4724,8 +5587,8 @@ export default function App() {
                 connection !== "online" ||
                 selectedThread?.canAcceptDirectInput === false
               }
-              readOnly={sending || queueing}
-              aria-busy={sending || queueing}
+              readOnly={sending || queueing || steeringSubmissionId !== null}
+              aria-busy={sending || queueing || steeringSubmissionId !== null}
             />
             {completionTarget && composerCanComplete ? (
               <div className="composer-completions" id="composer-completions">
@@ -4854,7 +5717,9 @@ export default function App() {
                           onClick={() => void queueMessage()}
                           onPointerDown={preserveComposerFocusOnPointerDown}
                           disabled={!canSteerOrQueue}
-                          aria-disabled={sending || queueing}
+                          aria-disabled={
+                            sending || queueing || steeringSubmissionId !== null
+                          }
                           title="Add this reply to the daemon's thread queue"
                         >
                           {queueing ? (
@@ -4868,7 +5733,9 @@ export default function App() {
                           onClick={() => void sendMessage(undefined, "steer")}
                           onPointerDown={preserveComposerFocusOnPointerDown}
                           disabled={!canSteerOrQueue}
-                          aria-disabled={sending || queueing}
+                          aria-disabled={
+                            sending || queueing || steeringSubmissionId !== null
+                          }
                         >
                           {sending ? (
                             <LoaderCircle className="spin" size={13} />

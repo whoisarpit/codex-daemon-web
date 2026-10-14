@@ -138,6 +138,15 @@ export type QueuedSubmission = {
   clientUserMessageId: string;
 };
 
+export type QueuedSteerRecovery = {
+  threadId: string;
+  submission: QueuedSubmission;
+  originalPosition: number;
+  originalQueueIds: string[];
+  status: "removing" | "steering" | "unknown" | "restoreFailed";
+  restoredSubmissionId?: string;
+};
+
 export type ApprovalPrompt = {
   id: RpcId;
   method: string;
