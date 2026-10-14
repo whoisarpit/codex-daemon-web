@@ -9,6 +9,7 @@ import {
   Command,
   FilePlus2,
   FileText,
+  Globe,
   ImagePlus,
   LoaderCircle,
   Menu,
@@ -32,6 +33,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type ComponentProps,
   type FormEvent,
   type ClipboardEvent as ReactClipboardEvent,
   type PointerEvent as ReactPointerEvent,
@@ -1837,6 +1839,11 @@ function useRpc() {
 }
 
 export default function App() {
+  if (window.location.pathname === "/browser") return <BrowserSurface />;
+  return <WorkspaceApp />;
+}
+
+function WorkspaceApp() {
   const [themeChoice, setThemeChoice] = useState<ThemeChoice>(readThemeChoice);
   const [booting, setBooting] = useState(true);
   const [status, setStatus] = useState<DaemonStatus | null>(null);
@@ -5193,7 +5200,6 @@ export default function App() {
       />
     );
   }
-
   const selectedTitle = selectedThread
     ? titleFor(selectedThread)
     : "New conversation";
@@ -5636,6 +5642,16 @@ export default function App() {
             <ChevronDown size={14} />
           </div>
           <div className="topbar-right">
+            <a
+              className="browser-shortcut"
+              href="/browser"
+              aria-label="Open the remote Codex browser"
+              target="_blank"
+              rel="noopener noreferrer"
+            >
+              <Globe size={15} aria-hidden="true" />
+              <span>Browser</span>
+            </a>
             <label className="theme-control" title="Color theme">
               <Sun size={14} aria-hidden="true" />
               <select
@@ -6572,6 +6588,448 @@ export default function App() {
   );
 }
 
+type BrowserTabInfo = {
+  id: number;
+  title: string;
+  url: string;
+  active: boolean;
+};
+
+type BrowserFrame = {
+  data: string;
+  width: number;
+  height: number;
+  title: string;
+  url: string;
+};
+
+async function browserRequest<T>(path: string, init?: RequestInit): Promise<T> {
+  const response = await fetch(`/api/browser${path}`, {
+    cache: "no-store",
+    credentials: "same-origin",
+    ...init,
+  });
+  let body: unknown;
+  try {
+    body = await response.json();
+  } catch {
+    body = null;
+  }
+  if (!response.ok) {
+    const error =
+      isRecord(body) && typeof body.error === "string"
+        ? body.error
+        : "The Codex browser could not complete that action.";
+    throw new Error(error);
+  }
+  return body as T;
+}
+
+function BrowserSurface() {
+  const [tabs, setTabs] = useState<BrowserTabInfo[]>([]);
+  const [selectedTabId, setSelectedTabId] = useState<number | null>(null);
+  const [frame, setFrame] = useState<BrowserFrame | null>(null);
+  const [address, setAddress] = useState("");
+  const [typedText, setTypedText] = useState("");
+  const [controlsEnabled, setControlsEnabled] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+  const gesture = useRef<{ pointerId: number; x: number; y: number } | null>(
+    null,
+  );
+  const addressInput = useRef<HTMLInputElement>(null);
+
+  const refreshTabs = useCallback(async () => {
+    try {
+      const next = await browserRequest<BrowserTabInfo[]>("/tabs");
+      setTabs(next);
+      setSelectedTabId((current) =>
+        current !== null && next.some((tab) => tab.id === current)
+          ? current
+          : (next.find((tab) => tab.active)?.id ?? next[0]?.id ?? null),
+      );
+      setError("");
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshTabs();
+    const timer = window.setInterval(() => void refreshTabs(), 5000);
+    return () => window.clearInterval(timer);
+  }, [refreshTabs]);
+
+  useEffect(() => {
+    if (selectedTabId === null) {
+      setFrame(null);
+      setAddress("");
+      return;
+    }
+    let cancelled = false;
+    let pending = false;
+    const capture = async () => {
+      if (pending || document.visibilityState !== "visible") return;
+      pending = true;
+      try {
+        const next = await browserRequest<BrowserFrame>(
+          `/tabs/${selectedTabId}/screenshot`,
+        );
+        if (!cancelled) {
+          setFrame(next);
+          if (!addressInput.current?.matches(":focus")) setAddress(next.url);
+          setError("");
+        }
+      } catch (cause) {
+        if (!cancelled)
+          setError(cause instanceof Error ? cause.message : String(cause));
+      } finally {
+        pending = false;
+      }
+    };
+    setFrame(null);
+    void capture();
+    const timer = window.setInterval(() => void capture(), 1400);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [selectedTabId]);
+
+  const post = useCallback(
+    async (path: string, body: Record<string, unknown>) =>
+      await browserRequest(path, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      }),
+    [],
+  );
+
+  const toggleControls = () => {
+    const next = !controlsEnabled;
+    setControlsEnabled(next);
+    setNotice(
+      next
+        ? "Manual controls are enabled. Codex automation can continue in this browser."
+        : "Manual controls are disabled.",
+    );
+    setError("");
+  };
+
+  const runTabAction = async (
+    action: string,
+    params: Record<string, unknown> = {},
+  ) => {
+    if (!controlsEnabled || selectedTabId === null) return;
+    setBusy(true);
+    try {
+      await post(`/tabs/${selectedTabId}`, { action, ...params });
+      setError("");
+      setNotice("");
+      if (action === "navigate" || action === "reload" || action === "back")
+        await refreshTabs();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const openAddress = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!controlsEnabled) return;
+    const value = address.trim();
+    const url = /^[a-z][a-z0-9+.-]*:/i.test(value) ? value : `https://${value}`;
+    if (!/^https?:\/\//i.test(url)) {
+      setError("Use an HTTP or HTTPS address.");
+      return;
+    }
+    if (selectedTabId === null) {
+      setBusy(true);
+      try {
+        const result = await browserRequest<{ id: number }>("/tabs", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ action: "new" }),
+        });
+        setSelectedTabId(result.id);
+        setTabs(await browserRequest<BrowserTabInfo[]>("/tabs"));
+        await post(`/tabs/${result.id}`, { action: "navigate", url });
+        setError("");
+      } catch (cause) {
+        setError(cause instanceof Error ? cause.message : String(cause));
+      } finally {
+        setBusy(false);
+      }
+      return;
+    }
+    await runTabAction("navigate", { url });
+  };
+
+  const createTab = async () => {
+    if (!controlsEnabled) return;
+    setBusy(true);
+    try {
+      const result = await browserRequest<{ id: number }>("/tabs", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "new" }),
+      });
+      const next = await browserRequest<BrowserTabInfo[]>("/tabs");
+      setTabs(next);
+      setSelectedTabId(result.id);
+      setError("");
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const sendText = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!controlsEnabled || !typedText) return;
+    await runTabAction("type", { text: typedText });
+    setTypedText("");
+  };
+
+  const remotePoint = (event: ReactPointerEvent<HTMLImageElement>) => {
+    const bounds = event.currentTarget.getBoundingClientRect();
+    return {
+      x: Math.max(
+        0,
+        Math.min(
+          frame?.width ?? event.currentTarget.naturalWidth,
+          ((event.clientX - bounds.left) / bounds.width) *
+            event.currentTarget.naturalWidth,
+        ),
+      ),
+      y: Math.max(
+        0,
+        Math.min(
+          frame?.height ?? event.currentTarget.naturalHeight,
+          ((event.clientY - bounds.top) / bounds.height) *
+            event.currentTarget.naturalHeight,
+        ),
+      ),
+    };
+  };
+
+  const beginGesture = (event: ReactPointerEvent<HTMLImageElement>) => {
+    if (!controlsEnabled || busy || event.button !== 0) return;
+    event.preventDefault();
+    event.currentTarget.setPointerCapture(event.pointerId);
+    gesture.current = {
+      pointerId: event.pointerId,
+      x: event.clientX,
+      y: event.clientY,
+    };
+  };
+
+  const endGesture = (event: ReactPointerEvent<HTMLImageElement>) => {
+    const current = gesture.current;
+    if (!current || current.pointerId !== event.pointerId) return;
+    gesture.current = null;
+    if (!controlsEnabled) return;
+    const distance = Math.hypot(
+      event.clientX - current.x,
+      event.clientY - current.y,
+    );
+    const point = remotePoint(event);
+    if (distance < 12) {
+      void runTabAction("click", point);
+      return;
+    }
+    const bounds = event.currentTarget.getBoundingClientRect();
+    const deltaX =
+      -((event.clientX - current.x) / bounds.width) *
+      (frame?.width ?? event.currentTarget.naturalWidth);
+    const deltaY =
+      -((event.clientY - current.y) / bounds.height) *
+      (frame?.height ?? event.currentTarget.naturalHeight);
+    void runTabAction("scroll", { ...point, deltaX, deltaY });
+  };
+
+  const title = frame?.title || "Codex browser";
+
+  return (
+    <main className="browser-page">
+      <header className="browser-header">
+        <a className="browser-back" href="/">
+          <ChevronRight size={17} aria-hidden="true" />
+          <span>Codex</span>
+        </a>
+        <div className="browser-title">
+          <strong>{title}</strong>
+          <span>
+            {controlsEnabled ? "Manual controls enabled" : "Live browser view"}
+          </span>
+        </div>
+        <button
+          className={`browser-control-button ${controlsEnabled ? "enabled" : ""}`}
+          type="button"
+          onClick={toggleControls}
+        >
+          {controlsEnabled ? "Disable controls" : "Enable controls"}
+        </button>
+      </header>
+      <div className="browser-tabbar">
+        <label className="browser-tab-picker">
+          <span>Browser tab</span>
+          <select
+            aria-label="Browser tab"
+            value={selectedTabId ?? ""}
+            onChange={(event) => {
+              const value = event.currentTarget.value;
+              if (!value) {
+                setSelectedTabId(null);
+                return;
+              }
+              const next = Number(value);
+              setSelectedTabId(Number.isSafeInteger(next) ? next : null);
+              if (controlsEnabled && Number.isSafeInteger(next))
+                void post(`/tabs/${next}`, { action: "select" }).catch(
+                  (cause) =>
+                    setError(
+                      cause instanceof Error ? cause.message : String(cause),
+                    ),
+                );
+            }}
+          >
+            {!tabs.length ? <option value="">No open tabs</option> : null}
+            {tabs.map((tab) => {
+              let host = "";
+              try {
+                host = new URL(tab.url).hostname;
+              } catch {}
+              return (
+                <option key={tab.id} value={tab.id}>
+                  {tab.title} {host ? `· ${host}` : ""}
+                </option>
+              );
+            })}
+          </select>
+        </label>
+        <button
+          className="browser-toolbar-button"
+          type="button"
+          disabled={!controlsEnabled || busy || selectedTabId === null}
+          onClick={() => void runTabAction("back")}
+        >
+          Back
+        </button>
+        <button
+          className="browser-toolbar-button"
+          type="button"
+          disabled={!controlsEnabled || busy || selectedTabId === null}
+          onClick={() => void runTabAction("reload")}
+        >
+          Reload
+        </button>
+        <button
+          className="browser-toolbar-button"
+          type="button"
+          disabled={!controlsEnabled || busy}
+          onClick={() => void createTab()}
+        >
+          New tab
+        </button>
+      </div>
+      <form className="browser-addressbar" onSubmit={openAddress}>
+        <input
+          ref={addressInput}
+          value={address}
+          aria-label="Browser address"
+          placeholder="Enter an HTTP or HTTPS address"
+          onChange={(event) => setAddress(event.target.value)}
+          readOnly={!controlsEnabled}
+        />
+        <button
+          className="browser-toolbar-button open"
+          type="submit"
+          disabled={!controlsEnabled || busy}
+        >
+          Open
+        </button>
+      </form>
+      <section className="browser-viewport" aria-label="Remote browser page">
+        {frame ? (
+          <img
+            className={
+              controlsEnabled
+                ? "browser-screenshot interactive"
+                : "browser-screenshot"
+            }
+            src={`data:image/jpeg;base64,${frame.data}`}
+            alt={`Live Codex browser view of ${title}`}
+            draggable={false}
+            onContextMenu={(event) => event.preventDefault()}
+            onPointerDown={beginGesture}
+            onPointerUp={endGesture}
+            onPointerCancel={() => {
+              gesture.current = null;
+            }}
+          />
+        ) : (
+          <div className="browser-empty">
+            <Globe size={24} aria-hidden="true" />
+            <strong>
+              {tabs.length
+                ? "Loading browser page"
+                : "No Codex browser tabs are open"}
+            </strong>
+            <span>
+              {tabs.length
+                ? "The live page will appear here."
+                : "Enable controls to open a new tab, or have Codex open the service first."}
+            </span>
+          </div>
+        )}
+        {!controlsEnabled && frame ? (
+          <div className="browser-watch-label">
+            Watching · enable controls to interact
+          </div>
+        ) : null}
+      </section>
+      {controlsEnabled ? (
+        <form className="browser-keyboard" onSubmit={sendText}>
+          <input
+            value={typedText}
+            aria-label="Type into selected browser tab"
+            placeholder="Type into the selected page"
+            onChange={(event) => setTypedText(event.target.value)}
+          />
+          <button
+            className="browser-toolbar-button"
+            type="submit"
+            disabled={busy || !typedText}
+          >
+            Type
+          </button>
+          <button
+            className="browser-toolbar-button"
+            type="button"
+            disabled={busy || selectedTabId === null}
+            onClick={() => void runTabAction("key", { key: "Enter" })}
+          >
+            Enter
+          </button>
+        </form>
+      ) : null}
+      {error || notice ? (
+        <div
+          className={`browser-feedback ${error ? "error" : ""}`}
+          role="status"
+        >
+          {error || notice}
+        </div>
+      ) : null}
+    </main>
+  );
+}
+
 function LoginScreen({
   token,
   setToken,
@@ -7335,8 +7793,37 @@ function SubAgentActivity({
 function MarkdownContent({ text }: { text: string }) {
   return (
     <div className="markdown-content">
-      <ReactMarkdown remarkPlugins={[remarkGfm]}>{text}</ReactMarkdown>
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        urlTransform={safeMarkdownUrl}
+        components={{
+          a: MarkdownLink,
+          img: ({ alt }) => <span>{alt}</span>,
+        }}
+      >
+        {text}
+      </ReactMarkdown>
     </div>
+  );
+}
+
+function safeMarkdownUrl(value: string): string {
+  if (!value.trim()) return "";
+  try {
+    const url = new URL(value, window.location.href);
+    return ["http:", "https:"].includes(url.protocol) ? url.href : "";
+  } catch {
+    return "";
+  }
+}
+
+function MarkdownLink({ href, children }: ComponentProps<"a">) {
+  const safeHref = href ? safeMarkdownUrl(href) : "";
+  if (!safeHref) return <span>{children}</span>;
+  return (
+    <a href={safeHref} target="_blank" rel="noopener noreferrer">
+      {children}
+    </a>
   );
 }
 
@@ -7427,8 +7914,14 @@ function ApprovalDialog({
           <div className="questions-list">
             {questions.map((question) => (
               <div className="question-block" key={asString(question.id)}>
-                <h3>{asString(question.header, "Question")}</h3>
-                <p>{asString(question.question)}</p>
+                <div className="question-heading" role="heading" aria-level={3}>
+                  <MarkdownContent
+                    text={asString(question.header, "Question")}
+                  />
+                </div>
+                <div className="question-copy">
+                  <MarkdownContent text={asString(question.question)} />
+                </div>
                 {Array.isArray(question.options) && question.options.length ? (
                   <div className="question-options">
                     {(question.options as Array<Record<string, unknown>>).map(
@@ -7438,31 +7931,47 @@ function ApprovalDialog({
                           answers[asString(question.id)] ?? []
                         ).includes(label);
                         return (
-                          <button
+                          <div
                             key={label}
                             className={`question-option ${selected ? "selected" : ""}`}
-                            onClick={() =>
-                              setAnswers({
-                                ...answers,
-                                [asString(question.id)]: selected
-                                  ? (
-                                      answers[asString(question.id)] ?? []
-                                    ).filter((entry) => entry !== label)
-                                  : [
-                                      ...(answers[asString(question.id)] ?? []),
-                                      label,
-                                    ],
-                              })
-                            }
                           >
-                            <span className="option-check">
-                              {selected ? <Check size={13} /> : null}
-                            </span>
-                            <span>
-                              <strong>{label}</strong>
-                              <small>{asString(option.description)}</small>
-                            </span>
-                          </button>
+                            <button
+                              type="button"
+                              className="question-option-select"
+                              aria-label={`${selected ? "Unselect" : "Select"} ${label}`}
+                              aria-pressed={selected}
+                              onClick={() =>
+                                setAnswers({
+                                  ...answers,
+                                  [asString(question.id)]: selected
+                                    ? (
+                                        answers[asString(question.id)] ?? []
+                                      ).filter((entry) => entry !== label)
+                                    : [
+                                        ...(answers[asString(question.id)] ??
+                                          []),
+                                        label,
+                                      ],
+                                })
+                              }
+                            >
+                              <span className="option-check">
+                                {selected ? <Check size={13} /> : null}
+                              </span>
+                            </button>
+                            <div className="question-option-content">
+                              <div className="question-option-label">
+                                <MarkdownContent text={label} />
+                              </div>
+                              {asString(option.description) ? (
+                                <div className="question-option-description">
+                                  <MarkdownContent
+                                    text={asString(option.description)}
+                                  />
+                                </div>
+                              ) : null}
+                            </div>
+                          </div>
                         );
                       },
                     )}

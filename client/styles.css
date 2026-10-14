@@ -1285,6 +1285,24 @@ button:disabled {
   gap: 10px;
   margin-left: auto;
 }
+.browser-shortcut {
+  display: inline-flex;
+  min-height: 30px;
+  align-items: center;
+  gap: 6px;
+  padding: 0 9px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  color: var(--text-standard);
+  font-size: 10px;
+  font-weight: 650;
+  text-decoration: none;
+}
+.browser-shortcut:hover {
+  border-color: var(--border-strong);
+  color: var(--text-strong);
+  background: var(--surface-subtle);
+}
 .theme-control {
   display: inline-flex;
   height: 29px;
@@ -3505,17 +3523,22 @@ button:disabled {
   border-radius: 9px;
   background: var(--surface-subtle);
 }
-.question-block h3 {
+.question-heading {
   margin: 0;
   color: var(--text-strong);
   font-size: 11px;
   font-weight: 700;
 }
-.question-block > p {
-  margin: 5px 0 9px;
+.question-heading .markdown-content p {
+  margin: 0;
+}
+.question-copy .markdown-content {
   color: var(--text-standard);
   font-size: 10.5px;
   line-height: 1.5;
+}
+.question-copy .markdown-content p {
+  margin: 5px 0 9px;
 }
 .question-options {
   display: grid;
@@ -3525,27 +3548,49 @@ button:disabled {
   display: flex;
   align-items: flex-start;
   gap: 8px;
-  padding: 8px;
+  padding: 5px 8px;
   border: 1px solid var(--border);
   border-radius: 7px;
   background: var(--surface-raised);
   text-align: left;
-  cursor: pointer;
 }
 .question-option.selected {
   border-color: var(--border-accent);
   background: var(--surface-info);
 }
-.question-option > span:nth-child(2) {
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
+.question-option-select {
+  display: grid;
+  width: 34px;
+  height: 34px;
+  flex: 0 0 auto;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  cursor: pointer;
 }
-.question-option strong {
+.question-option-select:hover {
+  background: var(--surface-subtle);
+}
+.question-option-content {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  align-self: center;
+  gap: 3px;
+  padding: 3px 0;
+}
+.question-option-label .markdown-content {
   color: var(--text-strong);
   font-size: 10px;
+  font-weight: 700;
 }
-.question-option small {
+.question-option-label .markdown-content p,
+.question-option-description .markdown-content p {
+  margin: 0;
+}
+.question-option-description .markdown-content {
   color: var(--text-standard);
   font-size: 9px;
   line-height: 1.45;
@@ -3564,6 +3609,214 @@ button:disabled {
 .question-option.selected .option-check {
   border-color: var(--border-accent);
   background: var(--surface-accent);
+}
+.browser-page {
+  position: fixed;
+  z-index: 100;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  color: var(--ink);
+  background: var(--paper);
+  overscroll-behavior: none;
+}
+.browser-header {
+  display: flex;
+  min-height: 58px;
+  align-items: center;
+  gap: 12px;
+  padding: max(8px, env(safe-area-inset-top)) 14px 8px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface-raised);
+}
+.browser-back {
+  display: inline-flex;
+  min-width: 52px;
+  min-height: 40px;
+  align-items: center;
+  gap: 2px;
+  color: var(--text-standard);
+  font-size: 11px;
+  font-weight: 650;
+  text-decoration: none;
+}
+.browser-back svg {
+  transform: rotate(180deg);
+}
+.browser-title {
+  display: flex;
+  min-width: 0;
+  flex: 1;
+  flex-direction: column;
+  gap: 3px;
+}
+.browser-title strong,
+.browser-title span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.browser-title strong {
+  color: var(--text-strong);
+  font-size: 11px;
+}
+.browser-title span {
+  color: var(--text-standard);
+  font-size: 9px;
+}
+.browser-control-button,
+.browser-toolbar-button {
+  min-height: 38px;
+  flex: 0 0 auto;
+  padding: 0 12px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  color: var(--text-strong);
+  background: var(--surface-raised);
+  font-size: 10px;
+  font-weight: 650;
+  cursor: pointer;
+}
+.browser-control-button {
+  border-color: var(--button-primary);
+  color: var(--text-on-accent);
+  background: var(--button-primary);
+}
+.browser-control-button.enabled {
+  border-color: var(--border-accent);
+  color: var(--text-strong);
+  background: var(--surface-accent);
+}
+.browser-control-button:disabled,
+.browser-toolbar-button:disabled {
+  opacity: 0.48;
+  cursor: not-allowed;
+}
+.browser-tabbar,
+.browser-addressbar,
+.browser-keyboard {
+  display: flex;
+  min-height: 52px;
+  align-items: center;
+  gap: 7px;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface-raised);
+}
+.browser-tab-picker {
+  display: flex;
+  min-width: 0;
+  flex: 1;
+  flex-direction: column;
+  gap: 3px;
+}
+.browser-tab-picker span {
+  color: var(--text-standard);
+  font-size: 8px;
+}
+.browser-tab-picker select,
+.browser-addressbar input,
+.browser-keyboard input {
+  width: 100%;
+  min-width: 0;
+  height: 34px;
+  padding: 0 9px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text-strong);
+  background: var(--surface-inset);
+  font-size: 10px;
+}
+.browser-addressbar {
+  min-height: 48px;
+  padding-top: 5px;
+  padding-bottom: 5px;
+}
+.browser-addressbar input {
+  height: 36px;
+  font-family: var(--mono);
+  font-size: 9px;
+}
+.browser-toolbar-button.open {
+  border-color: var(--border-accent);
+}
+.browser-viewport {
+  position: relative;
+  display: grid;
+  min-height: 0;
+  flex: 1;
+  place-items: center;
+  overflow: hidden;
+  background: #151819;
+  touch-action: none;
+}
+.browser-screenshot {
+  display: block;
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+  user-select: none;
+  -webkit-user-drag: none;
+  touch-action: none;
+}
+.browser-screenshot.interactive {
+  cursor: crosshair;
+}
+.browser-empty {
+  display: flex;
+  max-width: 300px;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 24px;
+  color: #f6f7f5;
+  text-align: center;
+}
+.browser-empty strong {
+  font-size: 13px;
+}
+.browser-empty span {
+  color: #b8c0bd;
+  font-size: 11px;
+  line-height: 1.5;
+}
+.browser-watch-label {
+  position: absolute;
+  right: 10px;
+  bottom: 10px;
+  padding: 6px 8px;
+  border: 1px solid #ffffff38;
+  border-radius: 6px;
+  color: white;
+  background: #151819d9;
+  font-size: 9px;
+  pointer-events: none;
+}
+.browser-keyboard {
+  min-height: 56px;
+  padding-bottom: max(7px, env(safe-area-inset-bottom));
+  border-top: 1px solid var(--border);
+  border-bottom: 0;
+}
+.browser-feedback {
+  position: absolute;
+  right: 10px;
+  bottom: calc(60px + env(safe-area-inset-bottom));
+  left: 10px;
+  z-index: 1;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  color: var(--text-standard);
+  background: var(--surface-raised);
+  font-size: 10px;
+  text-align: center;
+}
+.browser-feedback.error {
+  color: var(--red);
 }
 .other-answer {
   width: 100%;
@@ -4058,6 +4311,45 @@ button:disabled {
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
+  }
+}
+
+@media (max-width: 760px) {
+  .browser-shortcut {
+    justify-content: center;
+    width: 32px;
+    padding: 0;
+  }
+  .browser-shortcut span {
+    display: none;
+  }
+  .browser-header {
+    gap: 7px;
+    padding-right: 9px;
+    padding-left: 9px;
+  }
+  .browser-tabbar,
+  .browser-addressbar,
+  .browser-keyboard {
+    gap: 4px;
+    padding-right: 6px;
+    padding-left: 6px;
+  }
+  .browser-toolbar-button {
+    min-height: 36px;
+    padding: 0 8px;
+    font-size: 9px;
+  }
+  .browser-control-button {
+    min-height: 38px;
+    padding: 0 9px;
+    font-size: 9px;
+  }
+  .browser-tab-picker select {
+    height: 32px;
+    padding-right: 5px;
+    padding-left: 6px;
+    font-size: 9px;
   }
 }
 

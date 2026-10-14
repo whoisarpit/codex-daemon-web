@@ -30,6 +30,11 @@ import {
   pushConfiguration,
   savePushSubscription,
 } from "./push.js";
+import {
+  callBrowserBackend,
+  writeBrowserError,
+  type BrowserMethod,
+} from "./browser-control.js";
 
 const app = express();
 const server = createServer(app);
@@ -122,6 +127,89 @@ app.get("/api/status", requireSession, async (_request, response, next) => {
     next(error);
   }
 });
+
+app.get("/api/browser/tabs", requireSession, async (request, response) => {
+  response.setHeader("Cache-Control", "no-store");
+  const session = authenticatedSession(request);
+  if (!session) return response.status(401).json({ authenticated: false });
+  try {
+    response.json(await callBrowserBackend(session, "webGetTabs"));
+  } catch (error) {
+    writeBrowserError(error, response);
+  }
+});
+
+app.get(
+  "/api/browser/tabs/:id/screenshot",
+  requireSession,
+  async (request, response) => {
+    response.setHeader("Cache-Control", "no-store");
+    const session = authenticatedSession(request);
+    if (!session) return response.status(401).json({ authenticated: false });
+    const tabId = browserTabId(request.params.id);
+    if (!tabId)
+      return response.status(400).json({ error: "Invalid browser tab" });
+    try {
+      response.json(
+        await callBrowserBackend(session, "webScreenshot", { tabId }),
+      );
+    } catch (error) {
+      writeBrowserError(error, response);
+    }
+  },
+);
+
+app.post(
+  "/api/browser/tabs",
+  requireBrowserOrigin,
+  requireSession,
+  async (request, response) => {
+    const session = authenticatedSession(request);
+    if (!session) return response.status(401).json({ authenticated: false });
+    if (request.body?.action !== "new") {
+      return response.status(400).json({ error: "Invalid browser tab action" });
+    }
+    try {
+      response.status(201).json(await callBrowserBackend(session, "webNewTab"));
+    } catch (error) {
+      writeBrowserError(error, response);
+    }
+  },
+);
+
+app.post(
+  "/api/browser/tabs/:id",
+  requireBrowserOrigin,
+  requireSession,
+  async (request, response) => {
+    const session = authenticatedSession(request);
+    if (!session) return response.status(401).json({ authenticated: false });
+    const tabId = browserTabId(request.params.id);
+    if (!tabId)
+      return response.status(400).json({ error: "Invalid browser tab" });
+    const body = (request.body ?? {}) as Record<string, unknown>;
+    const actions: Record<string, BrowserMethod> = {
+      select: "webActivateTab",
+      navigate: "webNavigate",
+      reload: "webReload",
+      back: "webBack",
+      click: "webClick",
+      scroll: "webScroll",
+      type: "webType",
+      key: "webKey",
+    };
+    const method = actions[body.action as string];
+    if (!method)
+      return response.status(400).json({ error: "Invalid browser action" });
+    try {
+      response.json(
+        await callBrowserBackend(session, method, { ...body, tabId }),
+      );
+    } catch (error) {
+      writeBrowserError(error, response);
+    }
+  },
+);
 
 app.get(
   "/api/push/config",
@@ -277,6 +365,12 @@ app.post(
 app.use("/api", (_request, response) =>
   response.status(404).json({ error: "API route not found" }),
 );
+
+function browserTabId(value: unknown): number | null {
+  if (typeof value !== "string" || !/^[1-9]\d{0,8}$/.test(value)) return null;
+  const tabId = Number(value);
+  return Number.isSafeInteger(tabId) ? tabId : null;
+}
 
 if (process.env.NODE_ENV !== "development") {
   const serverDirectory = dirname(fileURLToPath(import.meta.url));
