@@ -391,8 +391,8 @@ button:disabled {
 .thread-row {
   position: relative;
   display: flex;
-  align-items: stretch;
-  min-height: 64px;
+  align-items: center;
+  min-height: 39px;
   margin: 2px 0;
   border-radius: 8px;
 }
@@ -405,9 +405,10 @@ button:disabled {
 .thread-select {
   display: flex;
   flex: 1;
-  flex-direction: column;
+  align-items: center;
   min-width: 0;
-  padding: 9px 8px 8px;
+  width: 100%;
+  padding: 9px 10px;
   border: 0;
   border-radius: inherit;
   background: transparent;
@@ -415,6 +416,8 @@ button:disabled {
   cursor: pointer;
 }
 .thread-name {
+  flex: 1;
+  min-width: 0;
   overflow: hidden;
   color: var(--ink);
   font-size: 11.7px;
@@ -422,55 +425,44 @@ button:disabled {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.thread-preview {
-  overflow: hidden;
-  margin-top: 3px;
-  color: var(--text-standard);
-  font-size: 10.5px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+.thread-select:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: -2px;
 }
-.thread-meta {
+.thread-context-menu {
+  position: fixed;
+  z-index: 80;
+  display: grid;
+  min-width: 184px;
+  padding: 4px;
+  border: 1px solid var(--border-strong);
+  border-radius: 9px;
+  color: var(--text-strong);
+  background: var(--surface-raised);
+  box-shadow: 0 8px 28px #00000030;
+}
+.thread-context-menu button {
   display: flex;
-  justify-content: space-between;
-  gap: 8px;
-  margin-top: 6px;
-  color: var(--muted);
-  font-size: 9px;
-}
-.thread-meta span:last-child {
-  max-width: 95px;
-  overflow: hidden;
-  font-family: var(--mono);
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.thread-actions {
-  display: flex;
-  align-items: flex-start;
-  gap: 1px;
-  padding: 6px 5px 0 0;
-  opacity: 0;
-  transition: opacity 0.13s ease;
-}
-.thread-row:hover .thread-actions,
-.thread-row:focus-within .thread-actions {
-  opacity: 1;
-}
-.thread-action {
-  display: inline-grid;
-  width: 25px;
-  height: 25px;
-  place-items: center;
+  align-items: center;
+  gap: 9px;
+  min-height: 36px;
+  padding: 0 9px;
   border: 0;
   border-radius: 6px;
-  color: var(--text-standard);
+  color: inherit;
   background: transparent;
+  font-size: 11px;
+  text-align: left;
   cursor: pointer;
 }
-.thread-action:hover {
+.thread-context-menu button:hover,
+.thread-context-menu button:focus-visible {
+  outline: 0;
   color: var(--ink);
   background: var(--surface-hover);
+}
+.thread-context-menu button svg {
+  color: var(--text-standard);
 }
 .rename-form {
   display: flex;
@@ -499,6 +491,11 @@ button:disabled {
   color: var(--green-dark);
   background: var(--surface-accent);
   cursor: pointer;
+}
+@media (pointer: coarse) {
+  .thread-context-menu button {
+    min-height: 44px;
+  }
 }
 .load-more-threads {
   width: 100%;

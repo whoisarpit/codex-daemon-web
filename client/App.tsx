@@ -34,6 +34,7 @@ import {
   type ClipboardEvent as ReactClipboardEvent,
   type PointerEvent as ReactPointerEvent,
 } from "react";
+import { createPortal } from "react-dom";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { RpcClient, type ConnectionState } from "./protocol";
@@ -68,6 +69,11 @@ type TimelineGroup =
       entries: TimelineItem[];
     };
 type ThreadTrailEntry = { id: string; title: string };
+type ThreadContextMenu = {
+  thread: ThreadSummary;
+  left: number;
+  top: number;
+};
 type ConversationRoute = { kind: "new" } | { kind: "thread"; threadId: string };
 type ConversationHistoryState = {
   codexDeskRoute: true;
@@ -1082,6 +1088,8 @@ export default function App() {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [renameId, setRenameId] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState("");
+  const [threadContextMenu, setThreadContextMenu] =
+    useState<ThreadContextMenu | null>(null);
   const [approvalQueue, setApprovalQueue] = useState<ApprovalPrompt[]>([]);
   const [questionAnswers, setQuestionAnswers] = useState<
     Record<string, string[]>
@@ -1095,6 +1103,20 @@ export default function App() {
   });
   const timelineRef = useRef<HTMLDivElement>(null);
   const composerRef = useRef<HTMLTextAreaElement>(null);
+  const threadContextMenuRef = useRef<HTMLDivElement>(null);
+  const threadContextMenuFirstActionRef = useRef<HTMLButtonElement>(null);
+  const threadContextMenuInvokerRef = useRef<HTMLButtonElement | null>(null);
+  const threadLongPressRef = useRef<{
+    thread: ThreadSummary;
+    target: HTMLButtonElement;
+    startX: number;
+    startY: number;
+    timer: number;
+  } | null>(null);
+  const suppressedLongPressClickRef = useRef<{
+    threadId: string;
+    timer: number;
+  } | null>(null);
   const scrollWasNearBottom = useRef(true);
   const loadVersionRef = useRef(0);
   const queueLoadVersionRef = useRef(0);
@@ -3198,6 +3220,140 @@ export default function App() {
     if (document.activeElement === composerRef.current) event.preventDefault();
   };
 
+  const openThreadContextMenu = (
+    thread: ThreadSummary,
+    x: number,
+    y: number,
+    invoker: HTMLButtonElement | null,
+  ) => {
+    const menuWidth = 190;
+    const menuHeight = 96;
+    threadContextMenuInvokerRef.current = invoker;
+    setThreadContextMenu({
+      thread,
+      left: Math.max(8, Math.min(x, window.innerWidth - menuWidth - 8)),
+      top: Math.max(8, Math.min(y, window.innerHeight - menuHeight - 8)),
+    });
+  };
+
+  const clearThreadLongPress = () => {
+    if (threadLongPressRef.current)
+      window.clearTimeout(threadLongPressRef.current.timer);
+    threadLongPressRef.current = null;
+  };
+
+  const suppressLongPressClick = (threadId: string) => {
+    if (suppressedLongPressClickRef.current)
+      window.clearTimeout(suppressedLongPressClickRef.current.timer);
+    const timer = window.setTimeout(() => {
+      suppressedLongPressClickRef.current = null;
+    }, 1200);
+    suppressedLongPressClickRef.current = { threadId, timer };
+  };
+
+  const handleThreadPointerDown = (
+    event: ReactPointerEvent<HTMLButtonElement>,
+    thread: ThreadSummary,
+  ) => {
+    if (event.pointerType !== "touch") return;
+    clearThreadLongPress();
+    const target = event.currentTarget;
+    const startX = event.clientX;
+    const startY = event.clientY;
+    const timer = window.setTimeout(() => {
+      threadLongPressRef.current = null;
+      suppressLongPressClick(thread.id);
+      openThreadContextMenu(thread, startX, startY, target);
+    }, 550);
+    threadLongPressRef.current = { thread, target, startX, startY, timer };
+  };
+
+  const handleThreadPointerMove = (
+    event: ReactPointerEvent<HTMLButtonElement>,
+  ) => {
+    const press = threadLongPressRef.current;
+    if (
+      press &&
+      (Math.abs(event.clientX - press.startX) > 12 ||
+        Math.abs(event.clientY - press.startY) > 12)
+    )
+      clearThreadLongPress();
+  };
+
+  const handleThreadContextMenu = (
+    event: React.MouseEvent<HTMLButtonElement>,
+    thread: ThreadSummary,
+  ) => {
+    event.preventDefault();
+    const press = threadLongPressRef.current;
+    if (press?.thread.id === thread.id) {
+      clearThreadLongPress();
+      suppressLongPressClick(thread.id);
+    }
+    openThreadContextMenu(
+      thread,
+      event.clientX,
+      event.clientY,
+      event.currentTarget,
+    );
+  };
+
+  useEffect(() => {
+    if (!threadContextMenu) return;
+    const frame = window.requestAnimationFrame(() =>
+      threadContextMenuFirstActionRef.current?.focus(),
+    );
+    const handlePointerDown = (event: PointerEvent) => {
+      if (!threadContextMenuRef.current?.contains(event.target as Node))
+        setThreadContextMenu(null);
+    };
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        setThreadContextMenu(null);
+        threadContextMenuInvokerRef.current?.focus();
+        return;
+      }
+      if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) return;
+      const items =
+        threadContextMenuRef.current?.querySelectorAll<HTMLButtonElement>(
+          '[role="menuitem"]',
+        );
+      if (!items?.length) return;
+      event.preventDefault();
+      const currentIndex = Array.from(items).indexOf(
+        document.activeElement as HTMLButtonElement,
+      );
+      const nextIndex =
+        event.key === "Home"
+          ? 0
+          : event.key === "End"
+            ? items.length - 1
+            : (currentIndex +
+                (event.key === "ArrowDown" ? 1 : -1) +
+                items.length) %
+              items.length;
+      items[nextIndex]?.focus();
+    };
+    document.addEventListener("pointerdown", handlePointerDown, true);
+    document.addEventListener("keydown", handleKeyDown);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      document.removeEventListener("pointerdown", handlePointerDown, true);
+      document.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [threadContextMenu]);
+
+  useEffect(
+    () => () => {
+      if (threadLongPressRef.current)
+        window.clearTimeout(threadLongPressRef.current.timer);
+      if (suppressedLongPressClickRef.current)
+        window.clearTimeout(suppressedLongPressClickRef.current.timer);
+    },
+    [],
+  );
+
   const archiveThread = async (thread: ThreadSummary) => {
     if (!client) return;
     try {
@@ -3549,49 +3705,51 @@ export default function App() {
                   <>
                     <button
                       className="thread-select"
-                      onClick={() => chooseThread(thread)}
+                      aria-haspopup="menu"
+                      aria-expanded={threadContextMenu?.thread.id === thread.id}
+                      title="Right-click or long-press for conversation actions"
+                      onClick={(event) => {
+                        if (
+                          suppressedLongPressClickRef.current?.threadId ===
+                          thread.id
+                        ) {
+                          window.clearTimeout(
+                            suppressedLongPressClickRef.current.timer,
+                          );
+                          suppressedLongPressClickRef.current = null;
+                          event.preventDefault();
+                          return;
+                        }
+                        chooseThread(thread);
+                      }}
+                      onContextMenu={(event) =>
+                        handleThreadContextMenu(event, thread)
+                      }
+                      onKeyDown={(event) => {
+                        if (
+                          event.key !== "ContextMenu" &&
+                          !(event.shiftKey && event.key === "F10")
+                        )
+                          return;
+                        event.preventDefault();
+                        const bounds =
+                          event.currentTarget.getBoundingClientRect();
+                        openThreadContextMenu(
+                          thread,
+                          bounds.left + 12,
+                          bounds.bottom,
+                          event.currentTarget,
+                        );
+                      }}
+                      onPointerDown={(event) =>
+                        handleThreadPointerDown(event, thread)
+                      }
+                      onPointerMove={handleThreadPointerMove}
+                      onPointerUp={clearThreadLongPress}
+                      onPointerCancel={clearThreadLongPress}
                     >
                       <span className="thread-name">{titleFor(thread)}</span>
-                      <span className="thread-preview">
-                        {thread.preview || thread.cwd}
-                      </span>
-                      <span className="thread-meta">
-                        <span>
-                          {archivedThreads
-                            ? formatRelativeTime(thread.updatedAt)
-                            : thread.recencyAt === null
-                              ? "—"
-                              : formatRelativeTime(thread.recencyAt)}
-                        </span>
-                        <span>
-                          {thread.cwd.split("/").filter(Boolean).at(-1) ||
-                            thread.cwd}
-                        </span>
-                      </span>
                     </button>
-                    <div className="thread-actions">
-                      <button
-                        className="thread-action"
-                        aria-label={`Rename ${titleFor(thread)}`}
-                        title="Rename"
-                        onClick={() => {
-                          setRenameId(thread.id);
-                          setRenameValue(
-                            thread.name ?? thread.preview.split("\n")[0] ?? "",
-                          );
-                        }}
-                      >
-                        <Pencil size={14} />
-                      </button>
-                      <button
-                        className="thread-action"
-                        aria-label={`${archivedThreads ? "Restore" : "Archive"} ${titleFor(thread)}`}
-                        title={archivedThreads ? "Restore" : "Archive"}
-                        onClick={() => void archiveThread(thread)}
-                      >
-                        <Archive size={14} />
-                      </button>
-                    </div>
                   </>
                 )}
               </div>
@@ -3628,6 +3786,56 @@ export default function App() {
           </button>
         </div>
       </aside>
+
+      {threadContextMenu
+        ? createPortal(
+            <div
+              ref={threadContextMenuRef}
+              className="thread-context-menu"
+              role="menu"
+              aria-label={`${titleFor(threadContextMenu.thread)} actions`}
+              style={{
+                left: threadContextMenu.left,
+                top: threadContextMenu.top,
+              }}
+              onBlur={(event) => {
+                if (!event.currentTarget.contains(event.relatedTarget as Node))
+                  setThreadContextMenu(null);
+              }}
+            >
+              <button
+                ref={threadContextMenuFirstActionRef}
+                type="button"
+                role="menuitem"
+                onClick={() => {
+                  setRenameId(threadContextMenu.thread.id);
+                  setRenameValue(
+                    threadContextMenu.thread.name ??
+                      threadContextMenu.thread.preview.split("\n")[0] ??
+                      "",
+                  );
+                  setThreadContextMenu(null);
+                }}
+              >
+                <Pencil size={14} aria-hidden="true" />
+                <span>Rename</span>
+              </button>
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => {
+                  const { thread } = threadContextMenu;
+                  setThreadContextMenu(null);
+                  void archiveThread(thread);
+                }}
+              >
+                <Archive size={14} aria-hidden="true" />
+                <span>{archivedThreads ? "Restore" : "Archive"}</span>
+              </button>
+            </div>,
+            document.body,
+          )
+        : null}
 
       <main className="main-panel">
         <header className="topbar">
@@ -5871,16 +6079,4 @@ function activityStatus(
 
 function capitalize(value: string): string {
   return value ? value[0].toUpperCase() + value.slice(1) : value;
-}
-
-function formatRelativeTime(timestamp: number): string {
-  const seconds = Math.max(0, Math.floor(Date.now() / 1000 - timestamp));
-  if (seconds < 60) return "now";
-  if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
-  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h`;
-  if (seconds < 604800) return `${Math.floor(seconds / 86400)}d`;
-  return new Date(timestamp * 1000).toLocaleDateString(undefined, {
-    month: "short",
-    day: "numeric",
-  });
 }
