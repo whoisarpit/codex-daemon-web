@@ -100,6 +100,45 @@ export type ModelOption = {
   }>;
 };
 
+export type ScheduledTaskMode = "sameChat" | "newChat";
+export type ScheduledTaskWeekday =
+  "MO" | "TU" | "WE" | "TH" | "FR" | "SA" | "SU";
+export type ScheduledTaskSchedule =
+  | { type: "interval"; minutes: number }
+  | { type: "daily"; time: string }
+  | { type: "weekly"; time: string; weekdays: ScheduledTaskWeekday[] };
+export type ScheduledTaskRun = {
+  id: string;
+  scheduledAt: number;
+  startedAt: number | null;
+  completedAt: number | null;
+  status: string;
+  threadId: string | null;
+  summary: string | null;
+  error: string | null;
+  manual: boolean;
+};
+export type ScheduledTask = {
+  id: string;
+  name: string;
+  prompt: string;
+  mode: ScheduledTaskMode;
+  sourceThreadId: string | null;
+  cwd: string | null;
+  timezone: string;
+  schedule: ScheduledTaskSchedule;
+  model: string | null;
+  reasoningEffort: string | null;
+  status: "active" | "paused" | "archived";
+  createdAt: number;
+  updatedAt: number;
+  nextRunAt: number | null;
+  pendingManualRun: boolean;
+  consecutiveFailures: number;
+  pauseReason: string | null;
+  runs: ScheduledTaskRun[];
+};
+
 export type ThreadDetails = {
   cwd: string;
   model: string | null;

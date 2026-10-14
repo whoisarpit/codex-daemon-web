@@ -39,6 +39,7 @@ import { createPortal } from "react-dom";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { RpcClient, type ConnectionState } from "./protocol";
+import ScheduledTasks from "./ScheduledTasks";
 import type {
   ApprovalPrompt,
   DaemonStatus,
@@ -5270,6 +5271,13 @@ export default function App() {
           <span>New conversation</span>
           <kbd>⌘ K</kbd>
         </button>
+
+        <ScheduledTasks
+          currentThread={selectedThread}
+          projectCwd={cwd || selectedThread?.cwd || ""}
+          models={models}
+          onOpenThread={(threadId) => navigateToThread(threadId, [], "push")}
+        />
 
         <div className="history-controls">
           <button

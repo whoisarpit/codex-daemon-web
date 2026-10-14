@@ -15,6 +15,8 @@
     "check": "tsc -b tsconfig.server.json tsconfig.app.json tsconfig.node.json --pretty false"
   },
   "dependencies": {
+    "@js-temporal/polyfill": "^0.5.1",
+    "@modelcontextprotocol/sdk": "^1.32.1",
     "dotenv": "^16.6.1",
     "express": "^5.1.0",
     "lucide-react": "^0.468.0",

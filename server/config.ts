@@ -165,6 +165,14 @@ export const config = {
     process.env.CODEX_WEB_PUSH_STATE_FILE ||
       join(dirname(tokenPath), "push-state.json"),
   ),
+  scheduledTasksPath: resolve(
+    process.env.CODEX_WEB_TASKS_FILE ||
+      join(dirname(tokenPath), "scheduled-tasks.json"),
+  ),
+  scheduledTasksSocketPath: resolve(
+    process.env.CODEX_WEB_TASKS_SOCKET_FILE ||
+      join(dirname(tokenPath), "scheduled-tasks.sock"),
+  ),
   defaultTokenPath: !process.env.CODEX_WEB_TOKEN_FILE,
   configuredAccessToken: process.env.CODEX_WEB_ACCESS_TOKEN,
   maxPayloadBytes: 1024 * 1024,
