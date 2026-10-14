@@ -86,6 +86,44 @@ type PushSetupState =
   "loading" | "ready" | "denied" | "unsupported" | "unavailable" | "error";
 type AppNotice = { tone: "info" | "error" | "success"; text: string };
 
+type ComposerCompletionTarget = {
+  kind: "file" | "skill";
+  start: number;
+  end: number;
+  query: string;
+};
+type ComposerCompletionItem =
+  | {
+      kind: "file";
+      path: string;
+      label: string;
+      isDirectory: boolean;
+    }
+  | {
+      kind: "skill";
+      name: string;
+      description: string;
+      path: string;
+    };
+type SelectedSkillReference = { name: string; path: string };
+type FuzzyFileSearchResult = {
+  path: string;
+  root: string;
+  file_name: string;
+  match_type: "file" | "directory";
+};
+type SkillsListResponse = {
+  data: Array<{
+    cwd: string;
+    skills: Array<{
+      name: string;
+      description: string;
+      path: string;
+      enabled: boolean;
+    }>;
+  }>;
+};
+
 type PushConfiguration = { ready: boolean; publicKey: string | null };
 
 const selectedThreadKey = "codex-desk.selected-thread";
@@ -544,13 +582,54 @@ function QueuedMessageStack({
 function userInputFromDraft(
   text: string,
   uploads: PendingUpload[],
+  selectedSkills: SelectedSkillReference[],
 ): UserInput[] {
   const input: UserInput[] = [];
   if (text.trim())
     input.push({ type: "text", text: text.trim(), text_elements: [] });
+  const uniqueSkills = new Map<string, SelectedSkillReference>();
+  for (const skill of selectedSkills) {
+    if (containsComposerToken(text, `$${skill.name}`))
+      uniqueSkills.set(skill.path, skill);
+  }
+  for (const skill of uniqueSkills.values())
+    input.push({ type: "skill", name: skill.name, path: skill.path });
   for (const upload of uploads)
     input.push({ type: "image", url: upload.dataUrl, detail: "auto" });
   return input;
+}
+
+function completionTargetAt(
+  text: string,
+  caret: number,
+): ComposerCompletionTarget | null {
+  const prefix = text.slice(0, caret);
+  const match = /(^|[\s([{])([@$])([^\s@$]*)$/.exec(prefix);
+  if (!match || (match[2] === "@" && !match[3])) return null;
+  const start = caret - match[2].length - match[3].length;
+  const remaining = text.slice(caret);
+  const following = /^[^\s@$]*/.exec(remaining)?.[0] ?? "";
+  return {
+    kind: match[2] === "@" ? "file" : "skill",
+    start,
+    end: caret + following.length,
+    query: match[3],
+  };
+}
+
+function containsComposerToken(text: string, token: string): boolean {
+  let offset = text.indexOf(token);
+  while (offset >= 0) {
+    const before = text[offset - 1];
+    const after = text[offset + token.length];
+    if (
+      (!before || !/[\p{L}\p{N}_-]/u.test(before)) &&
+      (!after || !/[\p{L}\p{N}_-]/u.test(after))
+    )
+      return true;
+    offset = text.indexOf(token, offset + 1);
+  }
+  return false;
 }
 
 function imagesFromClipboard(data: DataTransfer): {
@@ -950,6 +1029,24 @@ export default function App() {
   const [pushBusy, setPushBusy] = useState(false);
   const [pushError, setPushError] = useState("");
   const [composer, setComposer] = useState("");
+  const [completionTarget, setCompletionTarget] =
+    useState<ComposerCompletionTarget | null>(null);
+  const [completionItems, setCompletionItems] = useState<
+    ComposerCompletionItem[]
+  >([]);
+  const [completionIndex, setCompletionIndex] = useState(0);
+  const [completionLoading, setCompletionLoading] = useState(false);
+  const [completionError, setCompletionError] = useState("");
+  const [skillsRevision, setSkillsRevision] = useState(0);
+  const selectedSkillsRef = useRef<SelectedSkillReference[]>([]);
+  const dismissedCompletionRef = useRef<{
+    kind: ComposerCompletionTarget["kind"];
+    token: string;
+  } | null>(null);
+  const completionRequestRef = useRef(0);
+  const skillsCacheRef = useRef(
+    new Map<string, SkillsListResponse["data"][number]["skills"]>(),
+  );
   const [uploads, setUploads] = useState<PendingUpload[]>([]);
   const uploadsRef = useRef(uploads);
   const updateUploads = (
@@ -1548,6 +1645,11 @@ export default function App() {
 
   const handleNotification = useCallback(
     (method: string, params: Record<string, unknown>) => {
+      if (method === "skills/changed") {
+        skillsCacheRef.current.clear();
+        setSkillsRevision((current) => current + 1);
+        return;
+      }
       if (method === "error") {
         const error = isRecord(params.error) ? params.error : params;
         setNotice({
@@ -2488,6 +2590,15 @@ export default function App() {
 
   const selectedModel = models.find((entry) => entry.model === model);
   const availableEfforts = selectedModel?.supportedReasoningEfforts ?? [];
+  const completionCwd =
+    cwd.trim() || selectedThread?.cwd || threadDetails?.cwd || "";
+  const composerCanComplete =
+    Boolean(client) &&
+    connection === "online" &&
+    !loadingThread &&
+    !sending &&
+    !queueing &&
+    selectedThread?.canAcceptDirectInput !== false;
   const filteredThreads = useMemo(() => {
     const query = threadSearch.toLowerCase().trim();
     if (!query) return threads;
@@ -2498,6 +2609,215 @@ export default function App() {
     );
   }, [threadSearch, threads]);
   const timelineGrouping = useMemo(() => groupTimelineItems(items), [items]);
+
+  useEffect(() => {
+    const requestId = ++completionRequestRef.current;
+    const target = completionTarget;
+    const canComplete = target !== null && composerCanComplete;
+    if (!canComplete || !target || !client) {
+      setCompletionItems([]);
+      setCompletionLoading(false);
+      setCompletionError("");
+      return;
+    }
+    if (target.kind === "file" && (!completionCwd || !target.query)) {
+      setCompletionItems([]);
+      setCompletionLoading(false);
+      setCompletionError(
+        completionCwd ? "" : "Set a working directory to search files.",
+      );
+      return;
+    }
+
+    setCompletionItems([]);
+    setCompletionIndex(0);
+    setCompletionLoading(true);
+    setCompletionError("");
+    let sentFileSearch = false;
+    const timer = window.setTimeout(
+      () => {
+        if (target.kind === "file") {
+          sentFileSearch = true;
+          void client
+            .request<{ files: FuzzyFileSearchResult[] }>("fuzzyFileSearch", {
+              query: target.query,
+              roots: [completionCwd],
+              cancellationToken: "codex-daemon-web-composer",
+            })
+            .then((response) => {
+              if (completionRequestRef.current !== requestId) return;
+              setCompletionItems(
+                response.files.map((file) => ({
+                  kind: "file" as const,
+                  path: file.path,
+                  label:
+                    file.path.startsWith(`${file.root}/`) ||
+                    file.path.startsWith(`${file.root}\\`)
+                      ? file.path.slice(file.root.length + 1)
+                      : file.path,
+                  isDirectory: file.match_type === "directory",
+                })),
+              );
+              setCompletionLoading(false);
+            })
+            .catch((error: unknown) => {
+              if (completionRequestRef.current !== requestId) return;
+              setCompletionError(shortError(error));
+              setCompletionLoading(false);
+            });
+          return;
+        }
+
+        const cacheKey = completionCwd || "__default__";
+        const cachedSkills = skillsCacheRef.current.get(cacheKey);
+        const skillsRequest = cachedSkills
+          ? Promise.resolve(cachedSkills)
+          : client
+              .request<SkillsListResponse>("skills/list", {
+                ...(completionCwd ? { cwds: [completionCwd] } : {}),
+              })
+              .then((response) => {
+                const skills = response.data
+                  .filter(
+                    (entry) => !completionCwd || entry.cwd === completionCwd,
+                  )
+                  .flatMap((entry) => entry.skills)
+                  .filter((skill) => skill.enabled);
+                skillsCacheRef.current.set(cacheKey, skills);
+                return skills;
+              });
+        void skillsRequest
+          .then((skills) => {
+            if (completionRequestRef.current !== requestId) return;
+            const query = target.query.toLocaleLowerCase();
+            setCompletionItems(
+              skills
+                .filter(
+                  (skill) =>
+                    !query ||
+                    skill.name.toLocaleLowerCase().includes(query) ||
+                    skill.description.toLocaleLowerCase().includes(query),
+                )
+                .map((skill) => ({
+                  kind: "skill" as const,
+                  name: skill.name,
+                  description: skill.description,
+                  path: skill.path,
+                })),
+            );
+            setCompletionLoading(false);
+          })
+          .catch((error: unknown) => {
+            if (completionRequestRef.current !== requestId) return;
+            setCompletionError(shortError(error));
+            setCompletionLoading(false);
+          });
+      },
+      target.kind === "file" ? 140 : 80,
+    );
+
+    return () => {
+      window.clearTimeout(timer);
+      if (sentFileSearch && client && completionCwd) {
+        void client
+          .request("fuzzyFileSearch", {
+            query: "",
+            roots: [completionCwd],
+            cancellationToken: "codex-daemon-web-composer",
+          })
+          .catch(() => {});
+      }
+      if (completionRequestRef.current === requestId)
+        completionRequestRef.current += 1;
+    };
+  }, [
+    client,
+    composerCanComplete,
+    completionCwd,
+    completionTarget?.kind,
+    completionTarget?.query,
+    connection,
+    loadingThread,
+    queueing,
+    selectedThread?.canAcceptDirectInput,
+    sending,
+    skillsRevision,
+  ]);
+
+  useEffect(() => {
+    setCompletionTarget(null);
+    setCompletionItems([]);
+  }, [completionCwd, selectedThread?.id]);
+
+  useEffect(() => {
+    const selectedSkills = selectedSkillsRef.current;
+    selectedSkillsRef.current = selectedSkills.filter((skill) =>
+      containsComposerToken(composer, `$${skill.name}`),
+    );
+  }, [composer]);
+
+  const syncCompletionTarget = (text: string, caret: number) => {
+    const target = completionTargetAt(text, caret);
+    const dismissed = dismissedCompletionRef.current;
+    if (target && dismissed) {
+      const token = text.slice(target.start, target.end);
+      if (target.kind === dismissed.kind && token === dismissed.token) {
+        setCompletionTarget(null);
+        return;
+      }
+      dismissedCompletionRef.current = null;
+    }
+    setCompletionTarget(target);
+  };
+
+  const selectCompletion = (item: ComposerCompletionItem) => {
+    if (
+      !completionTarget ||
+      !client ||
+      connection !== "online" ||
+      loadingThread ||
+      sending ||
+      queueing ||
+      selectedThread?.canAcceptDirectInput === false
+    )
+      return;
+    const inserted =
+      item.kind === "file"
+        ? /\s/.test(item.path) && !item.path.includes('"')
+          ? `"${item.path}"`
+          : item.path
+        : `$${item.name}`;
+    const suffix = composer.slice(completionTarget.end);
+    const hasSeparator = /^\s/u.test(suffix);
+    const separator = hasSeparator ? suffix : ` ${suffix}`;
+    const caret = completionTarget.start + inserted.length + 1;
+    const nextText =
+      composer.slice(0, completionTarget.start) + inserted + separator;
+    if (item.kind === "skill")
+      selectedSkillsRef.current = [
+        ...selectedSkillsRef.current,
+        { name: item.name, path: item.path },
+      ];
+    dismissedCompletionRef.current =
+      item.kind === "skill" ? { kind: "skill", token: inserted } : null;
+    setComposer(nextText);
+    setCompletionTarget(null);
+    setCompletionItems([]);
+    setCompletionIndex(0);
+    requestAnimationFrame(() => {
+      const textarea = composerRef.current;
+      if (!textarea) return;
+      textarea.focus();
+      textarea.setSelectionRange(caret, caret);
+      textarea.style.height = "auto";
+      textarea.style.height = `${textarea.scrollHeight}px`;
+    });
+  };
+
+  const handleComposerChange = (text: string, caret: number) => {
+    setComposer(text);
+    syncCompletionTarget(text, caret);
+  };
 
   const sendMessage = async (
     event?: FormEvent<HTMLFormElement>,
@@ -2542,11 +2862,17 @@ export default function App() {
     const loadVersionAtSend = loadVersionRef.current;
     const composerAtSend = composer;
     const uploadsAtSend = [...uploads];
+    const selectedSkillsAtSend = [...selectedSkillsRef.current];
+    setCompletionTarget(null);
     let threadId = selectedThread?.id;
     const threadIdAtSend = threadId ?? null;
     const turnIdAtSend = activeTurnId;
     try {
-      const input = userInputFromDraft(composerAtSend, uploadsAtSend);
+      const input = userInputFromDraft(
+        composerAtSend,
+        uploadsAtSend,
+        selectedSkillsAtSend,
+      );
 
       if (shouldSteer) {
         const attemptKey = JSON.stringify([
@@ -2554,6 +2880,7 @@ export default function App() {
           turnIdAtSend,
           composerAtSend,
           uploadsAtSend.map((upload) => upload.id),
+          selectedSkillsAtSend,
         ]);
         const clientUserMessageId =
           steerAttemptRef.current?.key === attemptKey
@@ -2747,11 +3074,18 @@ export default function App() {
     const loadVersionAtQueue = loadVersionRef.current;
     const textAtQueue = composer;
     const uploadsAtQueue = [...uploads];
-    const input = userInputFromDraft(textAtQueue, uploadsAtQueue);
+    const selectedSkillsAtQueue = [...selectedSkillsRef.current];
+    setCompletionTarget(null);
+    const input = userInputFromDraft(
+      textAtQueue,
+      uploadsAtQueue,
+      selectedSkillsAtQueue,
+    );
     const attemptKey = JSON.stringify([
       threadIdAtQueue,
       textAtQueue,
       uploadsAtQueue.map((upload) => upload.id),
+      selectedSkillsAtQueue,
     ]);
     const clientUserMessageId =
       queueAttemptRef.current?.key === attemptKey
@@ -3613,12 +3947,101 @@ export default function App() {
               id="composer"
               onPaste={handleComposerPaste}
               value={composer}
+              role="combobox"
+              aria-autocomplete="list"
+              aria-expanded={Boolean(completionTarget && composerCanComplete)}
+              aria-controls={
+                completionTarget && composerCanComplete
+                  ? "composer-completions"
+                  : undefined
+              }
+              aria-activedescendant={
+                completionTarget &&
+                composerCanComplete &&
+                completionItems[completionIndex]
+                  ? `composer-completion-${completionIndex}`
+                  : undefined
+              }
+              onClick={(event) =>
+                syncCompletionTarget(
+                  event.currentTarget.value,
+                  event.currentTarget.selectionStart,
+                )
+              }
+              onKeyUp={(event) =>
+                syncCompletionTarget(
+                  event.currentTarget.value,
+                  event.currentTarget.selectionStart,
+                )
+              }
+              onSelect={(event) =>
+                syncCompletionTarget(
+                  event.currentTarget.value,
+                  event.currentTarget.selectionStart,
+                )
+              }
               onChange={(event) => {
-                setComposer(event.target.value);
+                handleComposerChange(
+                  event.currentTarget.value,
+                  event.currentTarget.selectionStart,
+                );
                 event.currentTarget.style.height = "auto";
                 event.currentTarget.style.height = `${event.currentTarget.scrollHeight}px`;
               }}
               onKeyDown={(event) => {
+                if (
+                  event.nativeEvent.isComposing ||
+                  event.nativeEvent.keyCode === 229
+                )
+                  return;
+                if (completionTarget && event.key === "Escape") {
+                  event.preventDefault();
+                  dismissedCompletionRef.current = {
+                    kind: completionTarget.kind,
+                    token: composer.slice(
+                      completionTarget.start,
+                      completionTarget.end,
+                    ),
+                  };
+                  setCompletionTarget(null);
+                  setCompletionItems([]);
+                  return;
+                }
+                if (
+                  completionItems.length > 0 &&
+                  completionTarget &&
+                  composerCanComplete
+                ) {
+                  if (event.key === "ArrowDown") {
+                    event.preventDefault();
+                    setCompletionIndex(
+                      (current) => (current + 1) % completionItems.length,
+                    );
+                    return;
+                  }
+                  if (event.key === "ArrowUp") {
+                    event.preventDefault();
+                    setCompletionIndex(
+                      (current) =>
+                        (current - 1 + completionItems.length) %
+                        completionItems.length,
+                    );
+                    return;
+                  }
+                  const unmodifiedKey =
+                    !event.shiftKey &&
+                    !event.ctrlKey &&
+                    !event.metaKey &&
+                    !event.altKey;
+                  if (
+                    unmodifiedKey &&
+                    (event.key === "Enter" || event.key === "Tab")
+                  ) {
+                    event.preventDefault();
+                    selectCompletion(completionItems[completionIndex]);
+                    return;
+                  }
+                }
                 if (
                   event.key === "Enter" &&
                   !event.shiftKey &&
@@ -3642,6 +4065,73 @@ export default function App() {
               readOnly={sending || queueing}
               aria-busy={sending || queueing}
             />
+            {completionTarget && composerCanComplete ? (
+              <div className="composer-completions" id="composer-completions">
+                <div className="composer-completions-heading">
+                  {completionTarget.kind === "file"
+                    ? "Files and folders"
+                    : "Skills"}
+                </div>
+                <div role="listbox" aria-label="Composer suggestions">
+                  {completionLoading ? (
+                    <div className="composer-completion-status" role="status">
+                      Searching…
+                    </div>
+                  ) : completionError ? (
+                    <div className="composer-completion-status" role="status">
+                      {completionError}
+                    </div>
+                  ) : completionItems.length ? (
+                    completionItems.map((item, index) => (
+                      <button
+                        type="button"
+                        role="option"
+                        id={`composer-completion-${index}`}
+                        aria-selected={index === completionIndex}
+                        className={`composer-completion-option ${index === completionIndex ? "selected" : ""}`}
+                        key={
+                          item.kind === "file"
+                            ? `${item.path}:${index}`
+                            : `${item.path}:${index}`
+                        }
+                        title={item.kind === "file" ? item.path : item.path}
+                        onPointerDown={(event) => event.preventDefault()}
+                        onMouseEnter={() => setCompletionIndex(index)}
+                        onClick={() => selectCompletion(item)}
+                      >
+                        {item.kind === "file" ? (
+                          <>
+                            <FileText size={15} aria-hidden="true" />
+                            <span className="composer-completion-copy">
+                              <strong>{item.label}</strong>
+                              <small>
+                                {item.isDirectory ? "Folder" : "File"}
+                              </small>
+                            </span>
+                          </>
+                        ) : (
+                          <>
+                            <Code2 size={15} aria-hidden="true" />
+                            <span className="composer-completion-copy">
+                              <strong>${item.name}</strong>
+                              <small>{item.description || item.path}</small>
+                            </span>
+                          </>
+                        )}
+                      </button>
+                    ))
+                  ) : (
+                    <div className="composer-completion-status" role="status">
+                      No {completionTarget.kind === "file" ? "files" : "skills"}{" "}
+                      found.
+                    </div>
+                  )}
+                </div>
+                <div className="composer-completions-hint">
+                  ↑↓ to navigate · Enter to select · Esc to dismiss
+                </div>
+              </div>
+            ) : null}
             <div className="composer-toolbar">
               <div className="composer-tools">
                 <label
