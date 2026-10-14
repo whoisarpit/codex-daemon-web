@@ -13,7 +13,6 @@ import {
   LoaderCircle,
   Menu,
   MessageSquareText,
-  MoreHorizontal,
   PanelLeftClose,
   PanelLeftOpen,
   Pencil,
@@ -5525,23 +5524,15 @@ export default function App() {
         </div>
 
         <div className="sidebar-footer">
-          <div className={`daemon-state ${currentConnection}`}>
-            <span className="status-dot" />
-            <span>{statusLabel(currentConnection)}</span>
-          </div>
           <div className="sidebar-footer-row">
-            <button
-              className="profile-button"
-              onClick={() => void signOut()}
-              title="Sign out"
+            <div
+              className={`daemon-state ${currentConnection}`}
+              role="status"
+              aria-live="polite"
             >
-              <span className="profile-avatar">C</span>
-              <span className="profile-copy">
-                <strong>Local daemon</strong>
-                <small>Sign out</small>
-              </span>
-              <MoreHorizontal size={17} />
-            </button>
+              <span className="status-dot" />
+              <span>{statusLabel(currentConnection)}</span>
+            </div>
             <button
               type="button"
               className="icon-button sidebar-settings"
@@ -5663,29 +5654,6 @@ export default function App() {
                 <option value="dark">Dark</option>
               </select>
             </label>
-            <span className={`connection-pill ${currentConnection}`}>
-              <span className="status-dot" />
-              {statusLabel(currentConnection)}
-            </span>
-            <button
-              className="icon-button topbar-help"
-              aria-label="Connection details"
-              title={
-                connectionMessage || status.daemon.endpoint || "Codex daemon"
-              }
-              onClick={() =>
-                setNotice({
-                  tone: connection === "online" ? "info" : "error",
-                  text:
-                    connectionMessage ||
-                    status.daemon.error ||
-                    status.daemon.endpoint ||
-                    "Connected to your local Codex daemon.",
-                })
-              }
-            >
-              <CircleHelp size={17} />
-            </button>
           </div>
         </header>
 
@@ -6563,6 +6531,22 @@ export default function App() {
                         >
                           Browse archived chats
                           <ChevronRight size={15} />
+                        </button>
+                      </div>
+                      <div className="settings-history settings-account">
+                        <div>
+                          <strong>Session</strong>
+                          <span>Sign out of this browser session.</span>
+                        </div>
+                        <button
+                          type="button"
+                          className="settings-history-button settings-signout-button"
+                          onClick={() => {
+                            setShowSettings(false);
+                            void signOut();
+                          }}
+                        >
+                          Sign out
                         </button>
                       </div>
                     </section>
