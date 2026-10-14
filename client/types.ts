@@ -143,3 +143,9 @@ export type ApprovalPrompt = {
   method: string;
   params: Record<string, unknown>;
 };
+
+export type McpServerElicitationResponse = {
+  action: "accept" | "decline" | "cancel";
+  content: unknown | null;
+  _meta: Record<string, unknown> | null;
+};

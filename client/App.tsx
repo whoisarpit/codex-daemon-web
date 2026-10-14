@@ -33,6 +33,7 @@ import {
   type FormEvent,
   type ClipboardEvent as ReactClipboardEvent,
   type PointerEvent as ReactPointerEvent,
+  type ReactNode,
 } from "react";
 import { createPortal } from "react-dom";
 import ReactMarkdown from "react-markdown";
@@ -49,6 +50,7 @@ import type {
   ThreadItemEntry,
   ThreadSummary,
   ThreadTokenUsage,
+  McpServerElicitationResponse,
   UserInput,
 } from "./types";
 import "./styles.css";
@@ -131,6 +133,448 @@ type SkillsListResponse = {
 };
 
 type PushConfiguration = { ready: boolean; publicKey: string | null };
+type McpElicitationChoice = { value: string; label: string };
+type McpElicitationField = {
+  id: string;
+  label: string;
+  description: string;
+  required: boolean;
+  kind: "string" | "number" | "boolean" | "single" | "multi";
+  integer?: boolean;
+  defaultValue?: string | number | boolean | string[];
+  options?: McpElicitationChoice[];
+  minimum?: number;
+  maximum?: number;
+  minLength?: number;
+  maxLength?: number;
+  minItems?: number;
+  maxItems?: number;
+  format?: "email" | "uri" | "date" | "date-time";
+};
+type McpElicitationFieldValue = string | boolean | string[] | null;
+
+function parseMcpElicitationFields(
+  schema: unknown,
+): McpElicitationField[] | null {
+  if (
+    !isRecord(schema) ||
+    schema.type !== "object" ||
+    !isRecord(schema.properties)
+  )
+    return null;
+  if (
+    Object.keys(schema).some(
+      (key) => !["$schema", "type", "properties", "required"].includes(key),
+    ) ||
+    (schema.$schema !== undefined && typeof schema.$schema !== "string")
+  )
+    return null;
+  const required = schema.required ?? [];
+  if (
+    !Array.isArray(required) ||
+    !required.every((field) => typeof field === "string")
+  )
+    return null;
+  const propertyMap = schema.properties;
+  const properties = Object.entries(propertyMap);
+  if (required.some((field) => !(field in propertyMap))) return null;
+  const fields: McpElicitationField[] = [];
+
+  for (const [id, property] of properties) {
+    if (!isRecord(property)) return null;
+    const allowedKeys =
+      property.enum !== undefined
+        ? ["type", "title", "description", "enum", "enumNames", "default"]
+        : Array.isArray(property.oneOf)
+          ? ["type", "title", "description", "oneOf", "default"]
+          : property.type === "string"
+            ? [
+                "type",
+                "title",
+                "description",
+                "minLength",
+                "maxLength",
+                "format",
+                "default",
+              ]
+            : property.type === "number" || property.type === "integer"
+              ? [
+                  "type",
+                  "title",
+                  "description",
+                  "minimum",
+                  "maximum",
+                  "default",
+                ]
+              : property.type === "boolean"
+                ? ["type", "title", "description", "default"]
+                : property.type === "array"
+                  ? [
+                      "type",
+                      "title",
+                      "description",
+                      "minItems",
+                      "maxItems",
+                      "items",
+                      "default",
+                    ]
+                  : [];
+    if (Object.keys(property).some((key) => !allowedKeys.includes(key)))
+      return null;
+    const field: McpElicitationField = {
+      id,
+      label: asString(property.title, id),
+      description: asString(property.description),
+      required: required.includes(id),
+      kind: "string",
+    };
+    const setBound = (
+      key:
+        | "minimum"
+        | "maximum"
+        | "minLength"
+        | "maxLength"
+        | "minItems"
+        | "maxItems",
+    ) => {
+      const value = property[key];
+      if (value === undefined) return true;
+      if (typeof value !== "number" || !Number.isFinite(value)) return false;
+      if (
+        (key === "minLength" ||
+          key === "maxLength" ||
+          key === "minItems" ||
+          key === "maxItems") &&
+        (!Number.isInteger(value) || value < 0)
+      )
+        return false;
+      field[key] = value;
+      return true;
+    };
+    const setDefault = (value: unknown) => {
+      if (
+        typeof value === "string" ||
+        typeof value === "number" ||
+        typeof value === "boolean" ||
+        (Array.isArray(value) &&
+          value.every((entry) => typeof entry === "string"))
+      )
+        field.defaultValue = value;
+    };
+
+    if (
+      property.type === "string" &&
+      property.enum === undefined &&
+      !Array.isArray(property.oneOf)
+    ) {
+      field.kind = "string";
+      if (
+        !setBound("minLength") ||
+        !setBound("maxLength") ||
+        (property.minLength !== undefined &&
+          property.maxLength !== undefined &&
+          Number(property.minLength) > Number(property.maxLength))
+      )
+        return null;
+      if (
+        property.format !== undefined &&
+        !["email", "uri", "date", "date-time"].includes(
+          asString(property.format),
+        )
+      )
+        return null;
+      if (property.format)
+        field.format = property.format as McpElicitationField["format"];
+      if (typeof property.default === "string") setDefault(property.default);
+    } else if (property.type === "number" || property.type === "integer") {
+      field.kind = "number";
+      field.integer = property.type === "integer";
+      if (
+        !setBound("minimum") ||
+        !setBound("maximum") ||
+        (property.minimum !== undefined &&
+          property.maximum !== undefined &&
+          Number(property.minimum) > Number(property.maximum))
+      )
+        return null;
+      if (typeof property.default === "number") setDefault(property.default);
+    } else if (property.type === "boolean") {
+      field.kind = "boolean";
+      if (typeof property.default === "boolean") setDefault(property.default);
+    } else if (property.type === "array") {
+      field.kind = "multi";
+      if (!setBound("minItems") || !setBound("maxItems")) return null;
+      const items = property.items;
+      if (!isRecord(items)) return null;
+      if (items.type === "string" && Array.isArray(items.enum)) {
+        if (
+          Object.keys(items).some((key) => !["type", "enum"].includes(key)) ||
+          !items.enum.every((value) => typeof value === "string") ||
+          new Set(items.enum).size !== items.enum.length
+        )
+          return null;
+        field.options = items.enum.map((value) => ({
+          value,
+          label: value,
+        }));
+      } else if (Array.isArray(items.anyOf)) {
+        if (Object.keys(items).some((key) => key !== "anyOf")) return null;
+        const options = items.anyOf.map((option) =>
+          isRecord(option) &&
+          typeof option.const === "string" &&
+          typeof option.title === "string"
+            ? { value: option.const, label: option.title }
+            : null,
+        );
+        if (
+          options.some((option) => option === null) ||
+          new Set(options.map((option) => option?.value)).size !==
+            options.length
+        )
+          return null;
+        field.options = options as McpElicitationChoice[];
+      } else {
+        return null;
+      }
+      if (
+        field.minItems !== undefined &&
+        field.maxItems !== undefined &&
+        field.minItems > field.maxItems
+      )
+        return null;
+      if (
+        Array.isArray(property.default) &&
+        property.default.every((value) =>
+          field.options?.some((option) => option.value === value),
+        )
+      )
+        setDefault(property.default);
+    } else if (property.enum !== undefined) {
+      field.kind = "single";
+      if (
+        !Array.isArray(property.enum) ||
+        !property.enum.every((value) => typeof value === "string") ||
+        new Set(property.enum).size !== property.enum.length
+      )
+        return null;
+      if (
+        property.enumNames !== undefined &&
+        (!Array.isArray(property.enumNames) ||
+          property.enumNames.length !== property.enum.length ||
+          !property.enumNames.every((value) => typeof value === "string"))
+      )
+        return null;
+      const enumNames = property.enumNames as string[] | undefined;
+      field.options = property.enum.map((value, index) => ({
+        value,
+        label: asString(enumNames?.[index], value),
+      }));
+      if (
+        typeof property.default === "string" &&
+        field.options.some((option) => option.value === property.default)
+      )
+        setDefault(property.default);
+    } else if (Array.isArray(property.oneOf)) {
+      field.kind = "single";
+      const options = property.oneOf.map((option) =>
+        isRecord(option) &&
+        typeof option.const === "string" &&
+        typeof option.title === "string"
+          ? { value: option.const, label: option.title }
+          : null,
+      );
+      if (
+        options.some((option) => option === null) ||
+        new Set(options.map((option) => option?.value)).size !== options.length
+      )
+        return null;
+      field.options = options as McpElicitationChoice[];
+      if (
+        typeof property.default === "string" &&
+        field.options.some((option) => option.value === property.default)
+      )
+        setDefault(property.default);
+    } else {
+      return null;
+    }
+    if (
+      field.minLength !== undefined &&
+      field.maxLength !== undefined &&
+      field.minLength > field.maxLength
+    )
+      return null;
+    fields.push(field);
+  }
+  return fields;
+}
+
+function initialMcpElicitationValues(
+  fields: McpElicitationField[],
+): Record<string, McpElicitationFieldValue> {
+  return Object.fromEntries(
+    fields.map((field) => {
+      const value = field.defaultValue;
+      if (value !== undefined) {
+        if (Array.isArray(value)) return [field.id, [...value]];
+        if (field.kind === "boolean") return [field.id, value === true];
+        return [field.id, String(value)];
+      }
+      return [
+        field.id,
+        field.kind === "multi" ? [] : field.kind === "single" ? null : "",
+      ];
+    }),
+  );
+}
+
+function isValidElicitationDate(value: string): boolean {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+  const date = new Date(`${value}T00:00:00Z`);
+  return (
+    Number.isFinite(date.getTime()) && date.toISOString().slice(0, 10) === value
+  );
+}
+
+function validateMcpElicitationValues(
+  fields: McpElicitationField[],
+  values: Record<string, McpElicitationFieldValue>,
+): { content?: Record<string, unknown>; error?: string } {
+  const content: Record<string, unknown> = Object.create(null);
+  for (const field of fields) {
+    const value = values[field.id];
+    if (field.kind === "string") {
+      const text = typeof value === "string" ? value : "";
+      const length = Array.from(text).length;
+      if (field.required && !text.trim())
+        return { error: `${field.label} is required.` };
+      if (text && field.minLength !== undefined && length < field.minLength)
+        return {
+          error: `${field.label} must have at least ${field.minLength} characters.`,
+        };
+      if (text && field.maxLength !== undefined && length > field.maxLength)
+        return {
+          error: `${field.label} must have at most ${field.maxLength} characters.`,
+        };
+      if (text && field.format === "email" && !/^\S+@\S+\.\S+$/.test(text))
+        return { error: `${field.label} must be an email address.` };
+      if (text && field.format === "uri") {
+        try {
+          if (!/^[a-z][a-z\d+.-]*:/i.test(text))
+            return { error: `${field.label} must be a URI.` };
+          new URL(text);
+        } catch {
+          return { error: `${field.label} must be a URI.` };
+        }
+      }
+      if (text && field.format === "date") {
+        if (!isValidElicitationDate(text))
+          return {
+            error: `${field.label} must be a valid date in YYYY-MM-DD format.`,
+          };
+      }
+      if (
+        text &&
+        field.format === "date-time" &&
+        (!/^\d{4}-\d{2}-\d{2}T.*(?:Z|[+-]\d{2}:\d{2})$/.test(text) ||
+          !isValidElicitationDate(text.slice(0, 10)) ||
+          !Number.isFinite(Date.parse(text)))
+      )
+        return { error: `${field.label} must be an ISO date and time.` };
+      if (text) content[field.id] = text;
+      continue;
+    }
+    if (field.kind === "number") {
+      const raw = typeof value === "string" ? value.trim() : "";
+      if (!raw) {
+        if (field.required) return { error: `${field.label} is required.` };
+        continue;
+      }
+      const number = Number(raw);
+      if (!Number.isFinite(number))
+        return { error: `${field.label} must be a valid number.` };
+      if (field.integer && !Number.isInteger(number))
+        return { error: `${field.label} must be an integer.` };
+      if (field.minimum !== undefined && number < field.minimum)
+        return { error: `${field.label} must be at least ${field.minimum}.` };
+      if (field.maximum !== undefined && number > field.maximum)
+        return { error: `${field.label} must be at most ${field.maximum}.` };
+      content[field.id] = number;
+      continue;
+    }
+    if (field.kind === "boolean") {
+      if (typeof value !== "boolean") {
+        if (field.required) return { error: `${field.label} is required.` };
+        continue;
+      }
+      content[field.id] = value;
+      continue;
+    }
+    if (field.kind === "single") {
+      const choice = typeof value === "string" ? value : "";
+      if (typeof value !== "string") {
+        if (field.required) return { error: `${field.label} is required.` };
+        continue;
+      }
+      if (!field.options?.some((option) => option.value === choice))
+        return { error: `Choose a valid option for ${field.label}.` };
+      content[field.id] = choice;
+      continue;
+    }
+    const choices = Array.isArray(value) ? value : [];
+    if (field.required && choices.length === 0)
+      return { error: `${field.label} is required.` };
+    if (field.minItems !== undefined && choices.length < field.minItems)
+      return {
+        error: `Choose at least ${field.minItems} options for ${field.label}.`,
+      };
+    if (field.maxItems !== undefined && choices.length > field.maxItems)
+      return {
+        error: `Choose at most ${field.maxItems} options for ${field.label}.`,
+      };
+    if (
+      choices.some(
+        (choice) => !field.options?.some((option) => option.value === choice),
+      )
+    )
+      return { error: `Choose valid options for ${field.label}.` };
+    if (choices.length || field.required) content[field.id] = choices;
+  }
+  return { content };
+}
+
+function approvalSupportsPersist(meta: Record<string, unknown>, value: string) {
+  const persist = meta.persist;
+  return typeof persist === "string"
+    ? persist === value
+    : Array.isArray(persist) && persist.includes(value);
+}
+
+function safeElicitationUrl(value: unknown, serverName: string): string | null {
+  if (typeof value !== "string") return null;
+  try {
+    const url = new URL(value);
+    if (
+      url.protocol !== "https:" ||
+      !url.hostname ||
+      url.username ||
+      url.password
+    )
+      return null;
+    if (serverName === "codex_apps") {
+      const host = url.hostname.toLowerCase();
+      if (
+        host !== "chatgpt.com" &&
+        host !== "chatgpt-staging.com" &&
+        !host.endsWith(".chatgpt.com") &&
+        !host.endsWith(".chatgpt-staging.com")
+      )
+        return null;
+    }
+    return url.toString();
+  } catch {
+    return null;
+  }
+}
 
 const selectedThreadKey = "codex-desk.selected-thread";
 const themeChoiceKey = "codex-daemon-web-theme";
@@ -1343,6 +1787,7 @@ export default function App() {
       "item/permissions/requestApproval",
       "item/tool/requestUserInput",
       "item/tool/call",
+      "mcpServer/elicitation/request",
     ].includes(approvalPrompt.method),
   );
 
@@ -1706,8 +2151,13 @@ export default function App() {
         return;
       }
       if (method === "serverRequest/resolved") {
+        const threadId = asString(params.threadId);
         setApprovalQueue((current) =>
-          current.filter((prompt) => prompt.id !== params.requestId),
+          current.filter(
+            (prompt) =>
+              prompt.id !== params.requestId ||
+              (threadId && asString(prompt.params.threadId) !== threadId),
+          ),
         );
         return;
       }
@@ -1921,7 +2371,11 @@ export default function App() {
         text: `Codex requested client tool “${name}”. Review the request and return an unsupported response.`,
       });
     }
-    setApprovalQueue((current) => [...current, request]);
+    setApprovalQueue((current) =>
+      current.some((prompt) => prompt.id === request.id)
+        ? current
+        : [...current, request],
+    );
   }, []);
 
   const openThread = useCallback(
@@ -3511,24 +3965,24 @@ export default function App() {
     void addImages(pasted.files);
   };
 
-  const replyApproval = (result: unknown) => {
-    if (!approvalPrompt || !client) return;
-    client.respond(approvalPrompt.id, result);
+  const replyApproval = (prompt: ApprovalPrompt, result: unknown) => {
+    if (!client) return;
+    client.respond(prompt.id, result);
     setApprovalQueue((current) =>
-      current.filter((prompt) => prompt.id !== approvalPrompt.id),
+      current.filter((entry) => entry.id !== prompt.id),
     );
     setQuestionAnswers({});
   };
 
-  const rejectUnknownRequest = () => {
-    if (!approvalPrompt || !client) return;
+  const rejectUnknownRequest = (prompt: ApprovalPrompt) => {
+    if (!client) return;
     const error: RpcError = {
       code: -32601,
       message: "This web client declined an unsupported server request.",
     };
-    client.reject(approvalPrompt.id, error);
+    client.reject(prompt.id, error);
     setApprovalQueue((current) =>
-      current.filter((prompt) => prompt.id !== approvalPrompt.id),
+      current.filter((entry) => entry.id !== prompt.id),
     );
   };
 
@@ -4655,8 +5109,8 @@ export default function App() {
           unknown={unknownRequest}
           answers={questionAnswers}
           setAnswers={setQuestionAnswers}
-          onReply={replyApproval}
-          onRejectUnknown={rejectUnknownRequest}
+          onReply={(result) => replyApproval(approvalPrompt, result)}
+          onRejectUnknown={() => rejectUnknownRequest(approvalPrompt)}
         />
       ) : null}
     </div>
@@ -5430,6 +5884,14 @@ function ApprovalDialog({
   const decisionEntries = Array.isArray(params.availableDecisions)
     ? params.availableDecisions
     : null;
+  if (method === "mcpServer/elicitation/request")
+    return (
+      <McpServerElicitationDialog
+        key={String(prompt.id)}
+        prompt={prompt}
+        onReply={onReply}
+      />
+    );
   if (unknown)
     return (
       <div className="modal-scrim">
@@ -5815,6 +6277,379 @@ function ApprovalDialog({
     );
   }
   return null;
+}
+
+function McpServerElicitationDialog({
+  prompt,
+  onReply,
+}: {
+  prompt: ApprovalPrompt;
+  onReply: (result: unknown) => void;
+}) {
+  const params = prompt.params;
+  const mode = asString(params.mode);
+  const serverName = asString(params.serverName, "MCP server");
+  const meta = isRecord(params._meta) ? params._meta : {};
+  const approval = meta.codex_approval_kind === "mcp_tool_call";
+  const fields =
+    mode === "form" ? parseMcpElicitationFields(params.requestedSchema) : null;
+  const safeUrl =
+    mode === "url" ? safeElicitationUrl(params.url, serverName) : null;
+  const [values, setValues] = useState(() =>
+    initialMcpElicitationValues(fields ?? []),
+  );
+  const [validationError, setValidationError] = useState("");
+  const [openedUrl, setOpenedUrl] = useState(false);
+  const dialogRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    dialogRef.current?.focus();
+  }, []);
+
+  const respond = (
+    action: McpServerElicitationResponse["action"],
+    content: unknown = null,
+    responseMeta: Record<string, unknown> | null = null,
+  ) => {
+    onReply({ action, content, _meta: responseMeta });
+  };
+
+  const frame = (eyebrow: string, title: string, children: ReactNode) => (
+    <div className="modal-scrim">
+      <div
+        className="approval-modal elicitation-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="approval-title"
+        tabIndex={-1}
+        ref={dialogRef}
+      >
+        <div className="approval-icon input">
+          <MessageSquareText size={19} />
+        </div>
+        <p className="eyebrow">{eyebrow}</p>
+        <h2 id="approval-title">{title}</h2>
+        <p className="approval-description">{serverName}</p>
+        {children}
+      </div>
+    </div>
+  );
+
+  if (mode === "form" && fields) {
+    const toolName = asString(meta.tool_name);
+    const title = asString(
+      meta.tool_title,
+      approval ? "Approve MCP tool call?" : "MCP server needs information",
+    );
+    const persistChoices = approval
+      ? ["session", "always"].filter((scope) =>
+          approvalSupportsPersist(meta, scope),
+        )
+      : [];
+    const submit = (persist: string | null = null) => {
+      const result = validateMcpElicitationValues(fields, values);
+      if (result.error) {
+        setValidationError(result.error);
+        return;
+      }
+      respond("accept", result.content ?? {}, persist ? { persist } : null);
+    };
+
+    return frame(
+      approval ? "MCP TOOL APPROVAL" : "MCP SERVER REQUEST",
+      title,
+      <>
+        {toolName ? <p className="elicitation-tool-name">{toolName}</p> : null}
+        {params.message ? (
+          <p className="approval-description">{asString(params.message)}</p>
+        ) : null}
+        {approval && meta.tool_params_display !== undefined ? (
+          <div className="request-details elicitation-preview">
+            <strong>Requested action</strong>
+            <pre>{formatUnknown(meta.tool_params_display)}</pre>
+          </div>
+        ) : null}
+        {fields.length ? (
+          <div className="elicitation-fields">
+            {fields.map((field) => (
+              <label className="elicitation-field" key={field.id}>
+                <span className="elicitation-label">
+                  {field.label}
+                  {field.required ? " *" : ""}
+                </span>
+                {field.description ? (
+                  <span className="elicitation-help">{field.description}</span>
+                ) : null}
+                {field.kind === "boolean" ? (
+                  <select
+                    value={
+                      typeof values[field.id] === "boolean"
+                        ? String(values[field.id])
+                        : ""
+                    }
+                    onChange={(event) =>
+                      setValues({
+                        ...values,
+                        [field.id]:
+                          event.target.value === ""
+                            ? ""
+                            : event.target.value === "true",
+                      })
+                    }
+                  >
+                    <option value="">Choose…</option>
+                    <option value="true">Yes</option>
+                    <option value="false">No</option>
+                  </select>
+                ) : null}
+                {field.kind === "string" ? (
+                  <input
+                    type="text"
+                    value={
+                      typeof values[field.id] === "string"
+                        ? (values[field.id] as string)
+                        : ""
+                    }
+                    minLength={field.minLength}
+                    maxLength={field.maxLength}
+                    onChange={(event) =>
+                      setValues({ ...values, [field.id]: event.target.value })
+                    }
+                  />
+                ) : null}
+                {field.kind === "number" ? (
+                  <input
+                    type="number"
+                    step={field.integer ? 1 : "any"}
+                    min={field.minimum}
+                    max={field.maximum}
+                    value={
+                      typeof values[field.id] === "string"
+                        ? (values[field.id] as string)
+                        : ""
+                    }
+                    onChange={(event) =>
+                      setValues({ ...values, [field.id]: event.target.value })
+                    }
+                  />
+                ) : null}
+                {field.kind === "single" ? (
+                  <select
+                    value={
+                      typeof values[field.id] === "string" &&
+                      field.options?.some(
+                        (option) => option.value === values[field.id],
+                      )
+                        ? JSON.stringify(values[field.id])
+                        : ""
+                    }
+                    onChange={(event) => {
+                      const selected = event.target.value;
+                      setValues({
+                        ...values,
+                        [field.id]: selected ? JSON.parse(selected) : null,
+                      });
+                    }}
+                  >
+                    <option value="">Choose…</option>
+                    {field.options?.map((option) => (
+                      <option
+                        value={JSON.stringify(option.value)}
+                        key={option.value}
+                      >
+                        {option.label}
+                      </option>
+                    ))}
+                  </select>
+                ) : null}
+                {field.kind === "multi" ? (
+                  <span className="elicitation-checkboxes">
+                    {field.options?.map((option) => {
+                      const selectedValues = values[field.id];
+                      const selected =
+                        Array.isArray(selectedValues) &&
+                        selectedValues.includes(option.value);
+                      return (
+                        <label
+                          className="elicitation-checkbox"
+                          key={option.value}
+                        >
+                          <input
+                            type="checkbox"
+                            checked={selected}
+                            onChange={() => {
+                              const currentValue = values[field.id];
+                              const current = Array.isArray(currentValue)
+                                ? currentValue
+                                : [];
+                              setValues({
+                                ...values,
+                                [field.id]: selected
+                                  ? current.filter(
+                                      (entry) => entry !== option.value,
+                                    )
+                                  : [...current, option.value],
+                              });
+                            }}
+                          />
+                          {option.label}
+                        </label>
+                      );
+                    })}
+                  </span>
+                ) : null}
+              </label>
+            ))}
+          </div>
+        ) : null}
+        {approval && meta.tool_description ? (
+          <details className="elicitation-raw-details">
+            <summary>Tool description</summary>
+            <p>{asString(meta.tool_description)}</p>
+          </details>
+        ) : null}
+        {approval && meta.tool_params !== undefined ? (
+          <details className="elicitation-raw-details">
+            <summary>Full tool parameters</summary>
+            <pre>{formatUnknown(meta.tool_params)}</pre>
+          </details>
+        ) : null}
+        {validationError ? (
+          <p className="elicitation-error" role="alert">
+            {validationError}
+          </p>
+        ) : null}
+        <div className="approval-actions approval-actions-wrap">
+          <button
+            className="secondary-action"
+            onClick={() => respond("decline")}
+          >
+            Decline
+          </button>
+          <button
+            className="secondary-action"
+            onClick={() => respond("cancel")}
+          >
+            Cancel
+          </button>
+          {persistChoices.includes("session") ? (
+            <button
+              className="secondary-action"
+              onClick={() => submit("session")}
+            >
+              Allow this session
+            </button>
+          ) : null}
+          {persistChoices.includes("always") ? (
+            <button
+              className="secondary-action"
+              onClick={() => submit("always")}
+            >
+              Always allow
+            </button>
+          ) : null}
+          <button className="primary-action" onClick={() => submit()}>
+            Allow once
+          </button>
+        </div>
+      </>,
+    );
+  }
+
+  if (mode === "url") {
+    let host = "Invalid or unsupported URL";
+    if (safeUrl) {
+      try {
+        host = new URL(safeUrl).host;
+      } catch {
+        host = "Invalid or unsupported URL";
+      }
+    }
+    return frame(
+      "MCP SERVER LINK",
+      "Continue in the browser?",
+      <>
+        <p className="approval-description">{asString(params.message)}</p>
+        <div className="request-details">
+          <strong>{host}</strong>
+        </div>
+        {safeUrl ? (
+          <div className="approval-actions approval-actions-wrap">
+            <button
+              className="secondary-action"
+              onClick={() => respond("decline")}
+            >
+              Decline
+            </button>
+            <button
+              className="secondary-action"
+              onClick={() => respond("cancel")}
+            >
+              Cancel
+            </button>
+            {openedUrl ? (
+              <button
+                className="primary-action"
+                onClick={() => respond("accept")}
+              >
+                I completed the request
+              </button>
+            ) : (
+              <button
+                className="primary-action"
+                onClick={() => {
+                  window.open(safeUrl, "_blank", "noopener,noreferrer");
+                  setOpenedUrl(true);
+                }}
+              >
+                Open link
+              </button>
+            )}
+          </div>
+        ) : (
+          <>
+            <p className="elicitation-error">
+              This link does not meet the client’s HTTPS safety rules.
+            </p>
+            <div className="approval-actions">
+              <button
+                className="secondary-action"
+                onClick={() => respond("decline")}
+              >
+                Decline request
+              </button>
+            </div>
+          </>
+        )}
+      </>,
+    );
+  }
+
+  const title =
+    mode === "openai/userVerification"
+      ? asString(params.title, "User verification is not supported here")
+      : "This elicitation mode is not supported here";
+  return frame(
+    "UNSUPPORTED MCP MODE",
+    title,
+    <>
+      {params.description ? (
+        <p className="approval-description">{asString(params.description)}</p>
+      ) : null}
+      {params.message ? (
+        <p className="approval-description">{asString(params.message)}</p>
+      ) : null}
+      <details className="elicitation-raw-details">
+        <summary>Request details</summary>
+        <pre>{formatUnknown(params)}</pre>
+      </details>
+      <div className="approval-actions">
+        <button className="secondary-action" onClick={() => respond("decline")}>
+          Decline unsupported request
+        </button>
+      </div>
+    </>,
+  );
 }
 
 function decisionName(value: unknown): string {

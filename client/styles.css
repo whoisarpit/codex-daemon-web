@@ -2443,6 +2443,87 @@ button:disabled {
   justify-content: flex-start;
   flex-wrap: wrap;
 }
+.elicitation-modal {
+  width: min(100%, 560px);
+}
+.elicitation-tool-name {
+  margin: 5px 0 0;
+  color: var(--text-standard);
+  font: 10px var(--mono);
+  overflow-wrap: anywhere;
+}
+.elicitation-preview pre,
+.elicitation-raw-details pre {
+  max-height: 190px;
+  overflow: auto;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+.elicitation-fields {
+  display: grid;
+  gap: 12px;
+  margin-top: 16px;
+}
+.elicitation-field {
+  display: grid;
+  gap: 6px;
+  color: var(--text-strong);
+  font-size: 10px;
+}
+.elicitation-label {
+  font-weight: 700;
+}
+.elicitation-help {
+  color: var(--text-standard);
+  font-size: 9px;
+  line-height: 1.5;
+}
+.elicitation-field > input,
+.elicitation-field > select {
+  width: 100%;
+  min-height: 35px;
+  padding: 7px 9px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  color: var(--text-strong);
+  background: var(--surface-raised);
+  font: inherit;
+  font-size: 11px;
+}
+.elicitation-checkboxes {
+  display: grid;
+  gap: 6px;
+}
+.elicitation-checkbox {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--text-standard);
+  font-size: 10px;
+}
+.elicitation-checkbox input {
+  accent-color: var(--button-primary);
+}
+.elicitation-raw-details {
+  margin-top: 12px;
+  color: var(--text-standard);
+  font-size: 10px;
+}
+.elicitation-raw-details summary {
+  cursor: pointer;
+  color: var(--text-strong);
+}
+.elicitation-raw-details p {
+  margin: 7px 0 0;
+  line-height: 1.5;
+  white-space: pre-wrap;
+}
+.elicitation-error {
+  margin: 12px 0 0;
+  color: var(--text-warning);
+  font-size: 10px;
+  line-height: 1.5;
+}
 .primary-action,
 .secondary-action {
   min-height: 35px;
