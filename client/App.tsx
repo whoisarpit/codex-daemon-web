@@ -96,12 +96,19 @@ type PushSetupState =
 type AppNotice = { tone: "info" | "error" | "success"; text: string };
 
 type ComposerCompletionTarget = {
-  kind: "file" | "skill";
+  kind: "command" | "file" | "skill";
   start: number;
   end: number;
   query: string;
 };
 type ComposerCompletionItem =
+  | {
+      kind: "command";
+      command: "/compact" | "/new";
+      description: string;
+      disabled?: boolean;
+      disabledReason?: string;
+    }
   | {
       kind: "file";
       path: string;
@@ -115,6 +122,7 @@ type ComposerCompletionItem =
       path: string;
     };
 type SelectedSkillReference = { name: string; path: string };
+type AgentIdentity = { glyph: string; color: number };
 type FuzzyFileSearchResult = {
   path: string;
   root: string;
@@ -1422,6 +1430,16 @@ function completionTargetAt(
   caret: number,
 ): ComposerCompletionTarget | null {
   const prefix = text.slice(0, caret);
+  const commandMatch = /^(\s*)\/([^\s]*)$/.exec(prefix);
+  if (commandMatch) {
+    const following = /^[^\s]*/.exec(text.slice(caret))?.[0] ?? "";
+    return {
+      kind: "command",
+      start: commandMatch[1].length,
+      end: caret + following.length,
+      query: commandMatch[2],
+    };
+  }
   const match = /(^|[\s([{])([@$])([^\s@$]*)$/.exec(prefix);
   if (!match || (match[2] === "@" && !match[3])) return null;
   const start = caret - match[2].length - match[3].length;
@@ -1433,6 +1451,54 @@ function completionTargetAt(
     end: caret + following.length,
     query: match[3],
   };
+}
+
+const composerCommands: Array<{
+  command: "/new" | "/compact";
+  description: string;
+}> = [
+  { command: "/new", description: "Start a new conversation" },
+  { command: "/compact", description: "Summarize this conversation" },
+];
+
+function isComposerCommandWithArguments(text: string): boolean {
+  return /^\/(?:new|compact)\s+\S/u.test(text.trim());
+}
+
+const agentIdentityGlyphs = ["✺", "✿", "⚙", "✣", "✦", "❖"];
+
+function agentIdentityFor(threadId: string, fallback: string): AgentIdentity {
+  const identity = threadId.trim() || fallback.trim() || "agent";
+  let hash = 2166136261;
+  for (let index = 0; index < identity.length; index += 1) {
+    hash ^= identity.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  const value = hash >>> 0;
+  return {
+    glyph: agentIdentityGlyphs[value % agentIdentityGlyphs.length],
+    color: (value >>> 4) % 8,
+  };
+}
+
+function AgentIdentityMark({
+  threadId,
+  fallback,
+  className = "",
+}: {
+  threadId: string;
+  fallback: string;
+  className?: string;
+}) {
+  const identity = agentIdentityFor(threadId, fallback);
+  return (
+    <span
+      className={`agent-identity agent-identity-color-${identity.color} ${className}`.trim()}
+      aria-hidden="true"
+    >
+      {identity.glyph}
+    </span>
+  );
 }
 
 function containsComposerToken(text: string, token: string): boolean {
@@ -1776,6 +1842,7 @@ export default function App() {
   const [authBusy, setAuthBusy] = useState(false);
   const [authError, setAuthError] = useState("");
   const [notice, setNotice] = useState<AppNotice | null>(null);
+  const noticeThreadIdRef = useRef<string | null>(null);
   const [threads, setThreads] = useState<ThreadSummary[]>([]);
   const threadsRef = useRef<ThreadSummary[]>([]);
   const [archivedThreads, setArchivedThreads] = useState(false);
@@ -1926,6 +1993,10 @@ export default function App() {
   };
   const [compressingUploads, setCompressingUploads] = useState(false);
   const compressingUploadsRef = useRef(false);
+  const [compactingThreadId, setCompactingThreadId] = useState<string | null>(
+    null,
+  );
+  const compactingThreadRef = useRef<string | null>(null);
   const [sending, setSending] = useState(false);
   const [queueing, setQueueing] = useState(false);
   const queueingRef = useRef(false);
@@ -1942,6 +2013,10 @@ export default function App() {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [renameId, setRenameId] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState("");
+  const threadNameRevisionRef = useRef(0);
+  const threadNameUpdatesRef = useRef(
+    new Map<string, { name: string; revision: number }>(),
+  );
   const [threadContextMenu, setThreadContextMenu] =
     useState<ThreadContextMenu | null>(null);
   const [approvalQueue, setApprovalQueue] = useState<ApprovalPrompt[]>([]);
@@ -2389,6 +2464,15 @@ export default function App() {
   }, [refreshStatus]);
 
   useEffect(() => {
+    const threadId = selectedThread?.id ?? null;
+    if (noticeThreadIdRef.current === threadId) return;
+    noticeThreadIdRef.current = threadId;
+    setNotice((current) =>
+      current && /context compaction/i.test(current.text) ? null : current,
+    );
+  }, [selectedThread?.id]);
+
+  useEffect(() => {
     const loadedAssets = appAssetSignature(document);
     if (!loadedAssets.length) return;
     let cancelled = false;
@@ -2454,6 +2538,7 @@ export default function App() {
 
   const refreshThreads = useCallback(
     async (rpc: RpcClient, archived = archivedThreads, append = false) => {
+      const nameRevisionAtRequest = threadNameRevisionRef.current;
       try {
         const result = await rpc.request<{
           data: ThreadSummary[];
@@ -2465,8 +2550,14 @@ export default function App() {
           archived,
           ...(append && threadCursor ? { cursor: threadCursor } : {}),
         });
+        const data = result.data.map((thread) => {
+          const update = threadNameUpdatesRef.current.get(thread.id);
+          return update && update.revision > nameRevisionAtRequest
+            ? { ...thread, name: update.name }
+            : thread;
+        });
         setThreads((current) =>
-          mergeThreadPage(current, result.data, append, !archived),
+          mergeThreadPage(current, data, append, !archived),
         );
         setThreadCursor(result.nextCursor);
       } catch (error) {
@@ -2547,6 +2638,48 @@ export default function App() {
     [],
   );
 
+  const applyThreadName = (threadId: string, name: string) => {
+    if (!threadId) return;
+    const revision = ++threadNameRevisionRef.current;
+    threadNameUpdatesRef.current.set(threadId, { name, revision });
+    threadsRef.current = threadsRef.current.map((thread) =>
+      thread.id === threadId ? { ...thread, name } : thread,
+    );
+    setThreads((current) =>
+      current.map((thread) =>
+        thread.id === threadId ? { ...thread, name } : thread,
+      ),
+    );
+    setSelectedThread((current) =>
+      current?.id === threadId ? { ...current, name } : current,
+    );
+    setThreadDetails((current) => {
+      if (!current || selectedRef.current !== threadId) return current;
+      return {
+        ...current,
+        thread: Object.assign({}, current.thread, { name }),
+      };
+    });
+    const nextTrail = threadTrailRef.current.map((entry) =>
+      entry.id === threadId ? { ...entry, title: name } : entry,
+    );
+    if (
+      nextTrail.some((entry, index) => entry !== threadTrailRef.current[index])
+    ) {
+      updateThreadTrail(nextTrail);
+      const historyState = readHistoryState(
+        window.history.state,
+        routeHash(routeRef.current),
+      );
+      writeHistoryRoute(
+        routeRef.current,
+        nextTrail,
+        "replace",
+        historyState?.parentRoute,
+      );
+    }
+  };
+
   const handleNotification = useCallback(
     (method: string, params: Record<string, unknown>) => {
       if (method === "skills/changed") {
@@ -2572,12 +2705,8 @@ export default function App() {
       }
       if (method === "thread/name/updated") {
         const threadId = asString(params.threadId);
-        const name = asString(params.name);
-        setThreads((current) =>
-          current.map((entry) =>
-            entry.id === threadId ? { ...entry, name } : entry,
-          ),
-        );
+        if (typeof params.name === "string")
+          applyThreadName(threadId, params.name);
         return;
       }
       if (method === "thread/archived" || method === "thread/unarchived") {
@@ -2834,6 +2963,7 @@ export default function App() {
     },
     [
       activeTurnId,
+      applyThreadName,
       archivedThreads,
       client,
       refreshThreadQueue,
@@ -2863,6 +2993,7 @@ export default function App() {
   const openThread = useCallback(
     async (rpc: RpcClient, threadId: string, announce = false) => {
       const version = ++loadVersionRef.current;
+      const nameRevisionAtRequest = threadNameRevisionRef.current;
       selectedRef.current = threadId;
       if (announce) setMobileSidebarOpen(false);
       const summary =
@@ -2903,7 +3034,19 @@ export default function App() {
           excludeTurns: true,
         });
         if (version !== loadVersionRef.current) return;
-        setThreadDetails(response);
+        const nameUpdate = threadNameUpdatesRef.current.get(threadId);
+        const confirmedName =
+          nameUpdate && nameUpdate.revision > nameRevisionAtRequest
+            ? nameUpdate.name
+            : undefined;
+        const detailsResponse =
+          confirmedName === undefined
+            ? response
+            : {
+                ...response,
+                thread: { ...response.thread, name: confirmedName },
+              };
+        setThreadDetails(detailsResponse);
         void refreshThreadQueue(rpc, threadId);
         setCwd(response.cwd || summary?.cwd || "");
         setModel(response.model || summary?.model || "");
@@ -2959,7 +3102,8 @@ export default function App() {
               response.thread.canAcceptDirectInput ??
               existing?.canAcceptDirectInput ??
               null,
-            name: response.thread.name ?? existing?.name ?? null,
+            name:
+              confirmedName ?? response.thread.name ?? existing?.name ?? null,
             preview: response.thread.preview ?? existing?.preview ?? "",
           };
         });
@@ -3601,6 +3745,7 @@ export default function App() {
     !loadingThread &&
     !sending &&
     !queueing &&
+    !compactingThreadId &&
     !steeringSubmissionId &&
     selectedThread?.canAcceptDirectInput !== false;
   const filteredThreads = useMemo(() => {
@@ -3620,6 +3765,31 @@ export default function App() {
     const canComplete = target !== null && composerCanComplete;
     if (!canComplete || !target || !client) {
       setCompletionItems([]);
+      setCompletionLoading(false);
+      setCompletionError("");
+      return;
+    }
+    if (target.kind === "command") {
+      const query = target.query.toLocaleLowerCase();
+      const compactDisabledReason = !selectedThread
+        ? "Open a conversation first"
+        : turnActive ||
+            Boolean(activeTurnId) ||
+            selectedThread.status.type === "active"
+          ? "Wait for the active turn to finish"
+          : undefined;
+      setCompletionItems(
+        composerCommands
+          .filter(({ command }) => command.slice(1).startsWith(query))
+          .map(({ command, description }) => ({
+            kind: "command" as const,
+            command,
+            description,
+            disabled: command === "/compact" && Boolean(compactDisabledReason),
+            disabledReason:
+              command === "/compact" ? compactDisabledReason : undefined,
+          })),
+      );
       setCompletionLoading(false);
       setCompletionError("");
       return;
@@ -3743,9 +3913,12 @@ export default function App() {
     connection,
     loadingThread,
     queueing,
+    activeTurnId,
+    compactingThreadId,
     selectedThread?.canAcceptDirectInput,
     sending,
     skillsRevision,
+    turnActive,
   ]);
 
   useEffect(() => {
@@ -3785,12 +3958,15 @@ export default function App() {
       selectedThread?.canAcceptDirectInput === false
     )
       return;
+    if (item.kind === "command" && item.disabled) return;
     const inserted =
       item.kind === "file"
         ? /\s/.test(item.path) && !item.path.includes('"')
           ? `"${item.path}"`
           : item.path
-        : `$${item.name}`;
+        : item.kind === "skill"
+          ? `$${item.name}`
+          : item.command;
     const suffix = composer.slice(completionTarget.end);
     const hasSeparator = /^\s/u.test(suffix);
     const separator = hasSeparator ? suffix : ` ${suffix}`;
@@ -3823,11 +3999,119 @@ export default function App() {
     syncCompletionTarget(text, caret);
   };
 
+  const clearComposerText = () => {
+    setComposer("");
+    if (composerRef.current) composerRef.current.style.height = "39px";
+  };
+
+  const runNewConversationCommand = () => {
+    setCompletionTarget(null);
+    setCompletionItems([]);
+    clearComposerText();
+    newConversation();
+  };
+
   const sendMessage = async (
     event?: FormEvent<HTMLFormElement>,
     action: "auto" | "steer" = "auto",
   ) => {
     event?.preventDefault();
+    const commandText = composer.trim();
+    if (commandText === "/new") {
+      runNewConversationCommand();
+      return;
+    }
+    if (commandText === "/compact") {
+      setCompletionTarget(null);
+      setCompletionItems([]);
+      if (compactingThreadRef.current) return;
+      if (!client || connection !== "online") {
+        setNotice({
+          tone: "info",
+          text: "Reconnect before compacting this conversation.",
+        });
+        return;
+      }
+      if (
+        !selectedThread ||
+        routeRef.current.kind !== "thread" ||
+        selectedRef.current !== selectedThread.id
+      ) {
+        setNotice({
+          tone: "info",
+          text: "Open a conversation before compacting its context.",
+        });
+        return;
+      }
+      if (selectedThread.canAcceptDirectInput === false) {
+        setNotice({
+          tone: "info",
+          text: "This agent is controlled by its parent.",
+        });
+        return;
+      }
+      if (
+        loadingThread ||
+        sending ||
+        queueing ||
+        queueingRef.current ||
+        queueSteerInFlightRef.current ||
+        steeringSubmissionId !== null ||
+        compressingUploadsRef.current
+      ) {
+        setNotice({
+          tone: "info",
+          text: "Wait for the current conversation action to finish before compacting.",
+        });
+        return;
+      }
+      if (
+        turnActive ||
+        activeTurnId ||
+        selectedThread.status.type === "active"
+      ) {
+        setNotice({
+          tone: "info",
+          text: "Wait for the active turn to finish before compacting.",
+        });
+        return;
+      }
+
+      const threadId = selectedThread.id;
+      const draftAtCommand = composer;
+      compactingThreadRef.current = threadId;
+      setCompactingThreadId(threadId);
+      setNotice({ tone: "info", text: "Starting context compaction…" });
+      try {
+        await client.request<Record<string, never>>("thread/compact/start", {
+          threadId,
+        });
+        if (selectedRef.current === threadId) {
+          if ((composerRef.current?.value ?? draftAtCommand) === draftAtCommand)
+            clearComposerText();
+          setNotice({ tone: "info", text: "Context compaction started." });
+        }
+      } catch (error) {
+        if (selectedRef.current === threadId)
+          setNotice({
+            tone: "error",
+            text: `Could not start context compaction: ${shortError(error)}`,
+          });
+      } finally {
+        compactingThreadRef.current = null;
+        setCompactingThreadId(null);
+      }
+      return;
+    }
+    if (isComposerCommandWithArguments(commandText)) {
+      setCompletionTarget(null);
+      setCompletionItems([]);
+      setNotice({
+        tone: "info",
+        text: "This command does not accept arguments.",
+      });
+      return;
+    }
     if (selectedThread?.canAcceptDirectInput === false) {
       setNotice({
         tone: "info",
@@ -3838,6 +4122,7 @@ export default function App() {
     if (
       sending ||
       queueingRef.current ||
+      compactingThreadRef.current ||
       queueSteerInFlightRef.current ||
       compressingUploadsRef.current ||
       (!composer.trim() && uploads.length === 0) ||
@@ -4061,10 +4346,30 @@ export default function App() {
   };
 
   const queueMessage = async () => {
+    const commandText = composer.trim();
+    if (commandText === "/new") {
+      runNewConversationCommand();
+      return;
+    }
+    if (isComposerCommandWithArguments(commandText)) {
+      setNotice({
+        tone: "info",
+        text: "This command does not accept arguments.",
+      });
+      return;
+    }
+    if (/^\/(?:new|compact)$/u.test(commandText)) {
+      setNotice({
+        tone: "info",
+        text: "Run this command directly; it cannot be queued as a reply.",
+      });
+      return;
+    }
     if (
       queueingRef.current ||
       queueSteerInFlightRef.current ||
       sending ||
+      compactingThreadRef.current ||
       compressingUploadsRef.current
     )
       return;
@@ -4682,17 +4987,19 @@ export default function App() {
     const name = renameValue.trim();
     if (!name) return;
     try {
-      await client.request("thread/name/set", { threadId, name });
-      setThreads((current) =>
-        current.map((entry) =>
-          entry.id === threadId ? { ...entry, name } : entry,
-        ),
-      );
-      if (selectedThread?.id === threadId)
-        setSelectedThread((current) =>
-          current ? { ...current, name } : current,
-        );
-      setRenameId(null);
+      const response = await client.request<unknown>("thread/name/set", {
+        threadId,
+        name,
+      });
+      const returnedName = isRecord(response)
+        ? typeof response.name === "string"
+          ? response.name
+          : isRecord(response.thread)
+            ? asString(response.thread.name)
+            : ""
+        : "";
+      applyThreadName(threadId, returnedName.trim() || name);
+      setRenameId((current) => (current === threadId ? null : current));
     } catch (error) {
       setNotice({
         tone: "error",
@@ -4705,16 +5012,18 @@ export default function App() {
     if (!files?.length) return;
     const blockedReason = compressingUploadsRef.current
       ? "Wait for the current image to finish processing before adding another."
-      : sending || queueingRef.current
-        ? "Wait for the current message to finish before adding an image."
-        : connection !== "online"
-          ? "Connect to Codex before adding an image."
-          : loadingThread ||
-              selectedRef.current !== (selectedThread?.id ?? null)
-            ? "Wait for the selected conversation to finish loading before adding an image."
-            : selectedThread?.canAcceptDirectInput === false
-              ? "This agent is controlled by its parent and cannot accept images."
-              : null;
+      : compactingThreadRef.current
+        ? "Wait for context compaction to finish before adding an image."
+        : sending || queueingRef.current
+          ? "Wait for the current message to finish before adding an image."
+          : connection !== "online"
+            ? "Connect to Codex before adding an image."
+            : loadingThread ||
+                selectedRef.current !== (selectedThread?.id ?? null)
+              ? "Wait for the selected conversation to finish loading before adding an image."
+              : selectedThread?.canAcceptDirectInput === false
+                ? "This agent is controlled by its parent and cannot accept images."
+                : null;
     if (blockedReason) {
       setNotice({ tone: "error", text: blockedReason });
       return;
@@ -4860,6 +5169,7 @@ export default function App() {
   const selectedTitle = selectedThread
     ? titleFor(selectedThread)
     : "New conversation";
+  const parentThread = threadTrail.at(-1);
   const currentConnection = status.daemon.available ? connection : "offline";
   const hasComposerContent = Boolean(composer.trim() || uploads.length);
   const hasActiveTurn = turnActive || Boolean(activeTurnId);
@@ -4867,6 +5177,7 @@ export default function App() {
     connection === "online" &&
     !sending &&
     !queueing &&
+    !compactingThreadId &&
     selectedThread?.canAcceptDirectInput !== false &&
     !loadingThread &&
     !compressingUploads &&
@@ -5123,7 +5434,6 @@ export default function App() {
                       }}
                     >
                       <Archive size={13} aria-hidden="true" />
-                      <span>{archivedThreads ? "Restore" : "Archive"}</span>
                     </button>
                   ) : null}
                 </div>
@@ -5239,7 +5549,13 @@ export default function App() {
                 onClick={returnToParentThread}
               >
                 <ChevronRight size={13} />
-                <span>Back to {threadTrail.at(-1)?.title}</span>
+                {parentThread ? (
+                  <AgentIdentityMark
+                    threadId={parentThread.id}
+                    fallback={parentThread.title}
+                  />
+                ) : null}
+                <span>Back to {parentThread?.title}</span>
               </button>
             ) : null}
             <span className="desktop-title">{selectedTitle}</span>
@@ -5542,6 +5858,7 @@ export default function App() {
                       aria-label={`Remove ${upload.name}`}
                       disabled={
                         compressingUploads ||
+                        compactingThreadId !== null ||
                         selectedThread?.canAcceptDirectInput === false
                       }
                       onClick={() =>
@@ -5679,17 +5996,36 @@ export default function App() {
                 connection !== "online" ||
                 selectedThread?.canAcceptDirectInput === false
               }
-              readOnly={sending || queueing || steeringSubmissionId !== null}
-              aria-busy={sending || queueing || steeringSubmissionId !== null}
+              readOnly={
+                sending ||
+                queueing ||
+                compactingThreadId !== null ||
+                steeringSubmissionId !== null
+              }
+              aria-busy={
+                sending ||
+                queueing ||
+                compactingThreadId !== null ||
+                steeringSubmissionId !== null
+              }
             />
             {completionTarget && composerCanComplete ? (
               <div className="composer-completions" id="composer-completions">
                 <div className="composer-completions-heading">
                   {completionTarget.kind === "file"
                     ? "Files and folders"
-                    : "Skills"}
+                    : completionTarget.kind === "skill"
+                      ? "Skills"
+                      : "Commands"}
                 </div>
-                <div role="listbox" aria-label="Composer suggestions">
+                <div
+                  role="listbox"
+                  aria-label={
+                    completionTarget.kind === "command"
+                      ? "Slash commands"
+                      : "Composer suggestions"
+                  }
+                >
                   {completionLoading ? (
                     <div className="composer-completion-status" role="status">
                       Searching…
@@ -5705,13 +6041,23 @@ export default function App() {
                         role="option"
                         id={`composer-completion-${index}`}
                         aria-selected={index === completionIndex}
-                        className={`composer-completion-option ${index === completionIndex ? "selected" : ""}`}
+                        disabled={
+                          item.kind === "command" && Boolean(item.disabled)
+                        }
+                        aria-disabled={
+                          item.kind === "command" && item.disabled
+                            ? "true"
+                            : undefined
+                        }
+                        className={`composer-completion-option ${item.kind === "command" ? "command" : ""} ${item.kind === "command" && item.disabled ? "disabled" : ""} ${index === completionIndex ? "selected" : ""}`}
                         key={
-                          item.kind === "file"
-                            ? `${item.path}:${index}`
+                          item.kind === "command"
+                            ? `${item.command}:${index}`
                             : `${item.path}:${index}`
                         }
-                        title={item.kind === "file" ? item.path : item.path}
+                        title={
+                          item.kind === "command" ? item.description : item.path
+                        }
                         onPointerDown={(event) => event.preventDefault()}
                         onMouseEnter={() => setCompletionIndex(index)}
                         onClick={() => selectCompletion(item)}
@@ -5726,7 +6072,7 @@ export default function App() {
                               </small>
                             </span>
                           </>
-                        ) : (
+                        ) : item.kind === "skill" ? (
                           <>
                             <Code2 size={15} aria-hidden="true" />
                             <span className="composer-completion-copy">
@@ -5734,13 +6080,26 @@ export default function App() {
                               <small>{item.description || item.path}</small>
                             </span>
                           </>
+                        ) : (
+                          <>
+                            <Command size={15} aria-hidden="true" />
+                            <span className="composer-completion-copy">
+                              <strong>{item.command}</strong>
+                              <small>
+                                {item.disabled
+                                  ? item.disabledReason
+                                  : item.description}
+                              </small>
+                            </span>
+                          </>
                         )}
                       </button>
                     ))
                   ) : (
                     <div className="composer-completion-status" role="status">
-                      No {completionTarget.kind === "file" ? "files" : "skills"}{" "}
-                      found.
+                      {completionTarget.kind === "command"
+                        ? "No supported commands found."
+                        : `No ${completionTarget.kind === "file" ? "files" : "skills"} found.`}
                     </div>
                   )}
                 </div>
@@ -5765,6 +6124,7 @@ export default function App() {
                       compressingUploads ||
                       sending ||
                       queueing ||
+                      compactingThreadId !== null ||
                       selectedThread?.canAcceptDirectInput === false
                     }
                     onChange={(event) => {
@@ -5867,7 +6227,7 @@ export default function App() {
                     disabled={!canSubmit}
                     aria-label="Send message"
                   >
-                    {sending ? (
+                    {sending || compactingThreadId ? (
                       <LoaderCircle className="spin" size={17} />
                     ) : (
                       <ArrowUp size={18} strokeWidth={2.3} />
@@ -6687,9 +7047,26 @@ function CollabAgentActivity({
   );
   const summary = (
     <>
-      <span className="activity-icon tool">
-        <Command size={14} />
-      </span>
+      {receiverIds.length ? (
+        <span className="agent-identity-stack" aria-hidden="true">
+          {receiverIds.slice(0, 3).map((threadId) => (
+            <AgentIdentityMark
+              key={threadId}
+              threadId={threadId}
+              fallback={threadId}
+            />
+          ))}
+          {receiverIds.length > 3 ? (
+            <span className="agent-identity-overflow">
+              +{receiverIds.length - 3}
+            </span>
+          ) : null}
+        </span>
+      ) : (
+        <span className="activity-icon tool">
+          <Command size={14} />
+        </span>
+      )}
       <span className="activity-title">{title}</span>
       {promptPreview ? (
         <span className="activity-context">{promptPreview}</span>
@@ -6741,7 +7118,13 @@ function CollabAgentActivity({
                     onOpenThread(threadId, asString(item.senderThreadId))
                   }
                 >
-                  <span>Agent {threadId.slice(0, 8)}</span>
+                  <span className="agent-thread-name">
+                    <AgentIdentityMark
+                      threadId={threadId}
+                      fallback={asString(state.name) || threadId}
+                    />
+                    <span>Agent {threadId.slice(0, 8)}</span>
+                  </span>
                   <span className={`activity-status ${agentStatus.className}`}>
                     {agentStatus.label}
                   </span>
@@ -6782,9 +7165,11 @@ function SubAgentActivity({
 
   return (
     <div className="activity-card activity-progress subagent-activity">
-      <span className="activity-icon tool">
-        <Command size={14} />
-      </span>
+      <AgentIdentityMark
+        className="subagent-identity"
+        threadId={threadId}
+        fallback={asString(item.agentName) || path}
+      />
       <span className="activity-title">
         {pathLabel} {kindLabels[kind] ?? "updated"}
       </span>
