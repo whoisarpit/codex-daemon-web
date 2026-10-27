@@ -1,134 +1,63 @@
 # Codex Daemon Web
 
-Codex Daemon Web is a reusable browser client and local bridge for the official Codex app-server. It attaches to an app-server that is already running under your Codex account. It does not start a daemon, create a private Codex home, or launch Codex commands on its own.
+Use Codex from a browser while its official app-server runs on your own machine. Codex Daemon Web is a self-hosted web client: it connects to an existing Codex daemon and gives you a responsive chat interface without moving the daemon or your project files to another host.
 
-The bridge gives each authenticated browser WebSocket its own app-server connection. It initializes that connection as `codex-daemon-web`, then forwards JSON-RPC requests, responses, notifications, and server-initiated requests between the browser and the daemon. The browser owns JSON-RPC request IDs and must answer app-server requests such as approval and user input requests. No dynamic tools are registered by default.
+It is designed for one trusted operator. The web app does not start Codex for you. Start the official app-server under the account whose files and tools Codex should use, then connect the web app to it.
 
-## Requirements
+All screenshots below use fictional conversations and project data. They contain no real workspace or conversation information.
 
-- Node.js 20 or newer
-- pnpm 12.10.1 (pinned in `package.json`)
-- Codex CLI with app-server support
+![Desktop view of Codex Daemon Web with a fictional chat](docs/screenshots/desktop-chat.png)
 
-## Run locally
+## Screenshots
 
-Start Codex's shared daemon in the same user account first:
+### Mobile chat
+
+<img width="300" src="docs/screenshots/mobile-chat.png" alt="Codex Daemon Web on a phone, showing a fictional chat" />
+
+### Scheduled tasks
+
+![Scheduled tasks and run history using fictional project data](docs/screenshots/schedules.png)
+
+## Get started
+
+You need Node.js 20 or newer, pnpm 12.10.1, and a Codex CLI version with app-server support. In one terminal, start the shared daemon as the same operating-system user that owns your Codex home and project files:
 
 ```sh
 codex app-server daemon start
 ```
 
-Then start the web app:
+In the repository, install dependencies and start the web app:
 
 ```sh
 pnpm install
 pnpm dev
 ```
 
-Open the Vite URL shown in the terminal, normally `http://127.0.0.1:5173`. The first server start creates a random access token at `~/.local/state/codex-daemon-web/access-token` (or `$XDG_STATE_HOME/codex-daemon-web/access-token`). Paste that token into the login screen. The file is kept outside the repository with owner-only permissions. You can replace it with `CODEX_WEB_ACCESS_TOKEN` or select another file with `CODEX_WEB_TOKEN_FILE`; configured access tokens must contain at least 32 characters.
+Open the local URL printed by Vite, usually `http://127.0.0.1:5173`. On first startup, the server creates a login token at `~/.local/state/codex-daemon-web/access-token` (or `$XDG_STATE_HOME/codex-daemon-web/access-token`). Paste that token into the login screen. The generated token file is stored outside the repository with owner-only permissions.
 
-The local Express server listens on `127.0.0.1:3001` during development and Vite proxies `/api`, including WebSocket upgrades, to it. The production server defaults to `127.0.0.1:3000` and serves the compiled client from `dist/client` alongside the backend in `dist/server`.
+The development server connects to the official app-server socket at `$CODEX_HOME/app-server-control/app-server-control.sock`, defaulting to `~/.codex`. The daemon must already be running and the socket must be available. For a production build, persistent configuration, and optional remote access, see [Configuration](docs/configuration.md) and the [Tailscale setup guide](docs/tailscale.md).
 
-```sh
-pnpm check
-pnpm build
-pnpm start
-```
+## What you can do
 
-## Run in Docker with the host daemon
+- Start, resume, rename, search, archive, and restore conversations.
+- Choose a model, reasoning effort, approval policy, sandbox, and working directory where supported by the connected Codex CLI.
+- Attach images, follow Codex output as it arrives, and queue, edit, or steer a reply while a turn is running.
+- Follow subagent work into its child conversation, and collapse activity groups or expand command and code details. See context usage when the connected CLI reports it.
+- Choose system, light, or dark appearance and optionally play a completion sound.
+- Create interval, daily, weekly, or five-field cron tasks in a chosen timezone. The scheduler runs through the connected app-server while this service is running. Each task keeps its run history and can reuse its own conversation across runs or start a new conversation for every run.
+- Answer supported scheduled-task questions from the app. Optional browser push notifications can alert a subscribed device.
+- Install the web app on a phone or desktop for a standalone window.
+- Use the browser and encrypted credential vault panels when a compatible Codex browser backend is separately available to the server.
 
-Running the web server directly on the host is the simplest way to use the default `$CODEX_HOME/app-server-control/app-server-control.sock` endpoint. The container image never starts a Codex daemon. If you run the bridge in Docker, start the shared host daemon first and give the bridge access only to its physical Unix-socket directory.
+Scheduled-task creation through Codex also has optional MCP servers; adding them to Codex is a separate setup step. Scheduled runs cannot approve actions. See [Configuration](docs/configuration.md) for scheduler behavior and optional MCP setup.
 
-The bridge must run as the same numeric UID and GID that own the socket. The image defaults to `1000:1000`. Resolve the current socket target on the host before creating the container:
+## How it connects
 
-```sh
-CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
-SOCKET_TARGET="$(readlink -f "$CODEX_HOME/app-server-control/app-server-control.sock")"
-test -S "$SOCKET_TARGET" || { echo "The shared Codex app-server socket is unavailable" >&2; exit 1; }
-SOCKET_DIRECTORY="$(dirname "$SOCKET_TARGET")"
-SOCKET_NAME="$(basename "$SOCKET_TARGET")"
-```
+Each signed-in browser session gets its own JSON-RPC connection to the official app-server. The browser client renders Codex conversations; the app-server continues to use the local account, CLI configuration, workspace access, and tools configured on that host. The bridge does not register extra tools by default.
 
-Build and run the bridge in the existing Tailscale container's network namespace, replacing `codex-tailscale` with your existing Tailscale container name. This reuses that node's identity; it does not create another Tailscale node or publish a host port.
+The login token protects the web app, but this is not a multi-user permission boundary. Anyone you give the token to can use the connected Codex account and the permissions selected for its runs. Keep the service on loopback or an authenticated private network, and choose sandbox and approval settings with the same care you use for Codex locally.
 
-```sh
-docker build -t codex-daemon-web:local .
-docker volume create codex-daemon-web-state
-docker run -d \
-  --name codex-daemon-web \
-  --network container:codex-tailscale \
-  --user 1000:1000 \
-  --read-only \
-  --tmpfs /tmp:rw,noexec,nosuid,size=64m,mode=1777 \
-  --cap-drop ALL \
-  --security-opt no-new-privileges:true \
-  --restart unless-stopped \
-  --mount "type=bind,source=$SOCKET_DIRECTORY,target=/daemon-sockets,readonly" \
-  --mount type=volume,source=codex-daemon-web-state,target=/var/lib/codex-daemon-web \
-  --env CODEX_APP_SERVER_URL="unix:///daemon-sockets/$SOCKET_NAME" \
-  --env PUBLIC_URL=https://codex.example.ts.net \
-  --env ALLOWED_ORIGINS=https://codex.example.ts.net \
-  --env COOKIE_SECURE=true \
-  codex-daemon-web:local
-```
-
-The socket directory mount is read-only and contains the daemon socket, not the Codex home, app-server logs, authentication files, conversation history, workspace, or CLI runtime. The app-server still runs host-side and handles built-in tools with the host user's permissions. The separate named volume stores the web login token across container recreation. Keep the network namespace and reverse-proxy rules private; configure your existing proxy to reach `127.0.0.1:3000` inside that namespace only after verifying the new service.
-
-The physical socket name is derived by Codex and can change between CLI implementations. Resolve the symlink again and recreate the container if the target basename changes. Mounting the whole physical socket directory lets the container see an ordinary daemon restart that replaces the socket inode at the same path. Do not mount only the socket file, because that can pin a stale inode. Confirm the resolved socket exists before starting the container; the web server will not start or restart the host daemon.
-
-## Configuration
-
-Environment variables can be set in the shell or in a local `.env` file (which is ignored by Git).
-
-| Variable                      | Default                                                  | Purpose                                                                                                |
-| ----------------------------- | -------------------------------------------------------- | ------------------------------------------------------------------------------------------------------ |
-| `HOST`                        | `127.0.0.1`                                              | HTTP listen address. Keep loopback when using a local reverse proxy.                                   |
-| `PORT`                        | `3000` in production, `3001` in development              | HTTP listen port.                                                                                      |
-| `CODEX_HOME`                  | `~/.codex`                                               | Selects the Codex home containing the shared daemon control socket.                                    |
-| `CODEX_APP_SERVER_URL`        | `$CODEX_HOME/app-server-control/app-server-control.sock` | Connect to `unix:///absolute/path`, `ws://`, or `wss://` app-server endpoint.                          |
-| `CODEX_APP_SERVER_AUTH_TOKEN` | unset                                                    | Sends a Bearer token to a configured WebSocket endpoint. Required for non-loopback `wss://` endpoints. |
-| `CODEX_WEB_ACCESS_TOKEN`      | generated token file                                     | Set a fixed login token; use at least 32 characters and keep it secret.                                |
-| `CODEX_WEB_TOKEN_FILE`        | `$XDG_STATE_HOME/codex-daemon-web/access-token`          | Change where the generated login token is stored.                                                      |
-| `CODEX_WEB_PUSH_STATE_FILE`   | next to the token file                                   | Change where the private VAPID key and browser subscriptions are stored.                               |
-| `XDG_STATE_HOME`              | `~/.local/state`                                         | Base directory for application state and the generated token.                                          |
-| `PUBLIC_URL`                  | unset                                                    | Public `http://` or `https://` origin when accessed through a reverse proxy.                           |
-| `ALLOWED_ORIGINS`             | local app origins                                        | Comma-separated browser origins allowed for login and WebSocket upgrades.                              |
-| `COOKIE_SECURE`               | enabled when `PUBLIC_URL` is HTTPS                       | Set to `true` when TLS terminates at a reverse proxy.                                                  |
-
-By default, the backend finds the official Unix socket at `$CODEX_HOME/app-server-control/app-server-control.sock`. It does not search for private daemon paths or launch the daemon when that socket is absent. The socket must be available before browser sessions can connect.
-
-For an app-server at another host, configure `CODEX_APP_SERVER_URL=wss://...` and `CODEX_APP_SERVER_AUTH_TOKEN`. Cleartext `ws://` is allowed only for loopback endpoints. The bridge never sends the daemon endpoint's authentication token to the browser.
-
-## Reverse proxy
-
-The HTTP server binds to loopback by default. A Tailscale Serve or other reverse proxy can publish it while the service remains local. Configure the public origin and secure cookie explicitly, for example:
-
-```sh
-PUBLIC_URL=https://codex.example.ts.net \
-COOKIE_SECURE=true \
-ALLOWED_ORIGINS=https://codex.example.ts.net \
-pnpm start
-```
-
-The proxy must forward HTTP WebSocket upgrades to `/api/rpc`. The bridge validates the browser `Origin` against `PUBLIC_URL` and `ALLOWED_ORIGINS`; it does not trust `Forwarded` or `X-Forwarded-*` headers. Do not expose the service over an unauthenticated public network. Use TLS and an authenticated private network or reverse proxy.
-
-## API and protocol notes
-
-- `POST /api/login` accepts `{ "token": "..." }`, sets an `HttpOnly`, `SameSite=Strict` session cookie for 180 days, and returns status. Session records persist beside the access-token file, so browser logins survive server restarts. Authenticated HTTP requests renew the session and cookie when fewer than 30 days remain. The persisted file contains session ID hashes, expiry times, and an access-token fingerprint; rotating the access token invalidates existing sessions.
-- `GET /api/status` requires that cookie and returns `{ "authenticated": true, "daemon": { "available": boolean, "error?": string, "endpoint": string } }`.
-- `POST /api/logout` clears the session cookie and immediately closes that login session's active browser connections.
-- `GET /api/push/config`, `POST /api/push/subscription`, and `DELETE /api/push/subscription` require an authenticated session. The config response reports server readiness and its VAPID key; subscription routes persist each explicitly enabled browser.
-- Authenticated WebSocket clients connect to `/api/rpc`. After the backend initializes the upstream app-server, it sends `{ "method": "bridge/ready", "params": {} }`. Bridge-local failures use `{ "method": "bridge/error", "params": { "message": "..." } }`.
-
-After upgrading from a version that kept sessions only in memory, sign in once again. Existing cookies cannot be migrated because their session records were not persisted.
-
-The service worker displays a generic “Codex needs your input” notification and opens the encoded thread route when clicked. The push payload does not include question text. The bridge observes `item/tool/requestUserInput` requests on the existing browser connection and forwards them unchanged. The app-server protocol exposes these requests on the connection handling a thread; there is no global request event source, so notifications are sent only while a browser bridge is connected. Push cannot detect a question that arrives while the browser app is closed.
-
-Install Codex Desk from the browser’s app menu to open it in a standalone window. Its root-scoped service worker handles push notifications for the installed app.
-
-The browser must not send `initialize` or `initialized`; the bridge owns that handshake. It forwards app-server RPC messages after initialization. Every browser connection has independent upstream state and request IDs. WebSocket payloads are capped at 1 MiB, the bridge closes slow clients, and login attempts are rate limited by the direct peer address.
-
-The app-server API evolves with Codex CLI releases. The bridge enables `experimentalApi`, so the browser client should treat protocol fields and methods as version-dependent. See the [official app-server documentation](https://developers.openai.com/codex/app-server).
+The app-server protocol changes with Codex CLI releases. Codex Daemon Web enables the app-server experimental API, so available models, settings, and protocol features depend on the CLI version. See the [official app-server documentation](https://developers.openai.com/codex/app-server).
 
 ## License
 
