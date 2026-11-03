@@ -165,6 +165,10 @@ export const config = {
     process.env.CODEX_WEB_PUSH_STATE_FILE ||
       join(dirname(tokenPath), "push-state.json"),
   ),
+  subagentReturnPath: resolve(
+    process.env.CODEX_WEB_SUBAGENT_RETURNS_FILE || join(dirname(tokenPath), "subagent-returns.json"),
+  ),
+  subagentReturnEnabled: parseBoolean(process.env.CODEX_WEB_SUBAGENT_RETURNS_ENABLED, true),
   scheduledTasksPath: resolve(
     process.env.CODEX_WEB_TASKS_FILE ||
       join(dirname(tokenPath), "scheduled-tasks.json"),

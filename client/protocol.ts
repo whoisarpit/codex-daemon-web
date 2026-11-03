@@ -40,8 +40,32 @@ export class RpcClient {
   private closed = false;
   private ready = false;
   private bridgeError = "";
+  private readonly networkRestored = () => {
+    // A network switch can leave a WebSocket looking OPEN forever although
+    // its TCP path is dead. Force a new bridge handshake, never replay turns.
+    this.restartConnection();
+  };
 
   constructor(private options: RpcClientOptions) {
+    window.addEventListener("online",this.networkRestored);
+    window.addEventListener("codexdesk-network-restored",this.networkRestored);
+    this.open();
+  }
+
+  private restartConnection(): void {
+    if(this.closed)return;
+    if(this.retryTimer!==undefined)window.clearTimeout(this.retryTimer);
+    this.retryTimer=undefined;
+    const old=this.socket;
+    this.socket=null;
+    this.ready=false;
+    this.failPending(new Error("Network changed. An interrupted message was not retried."));
+    if(old){
+      // Ignore close notifications from the retired socket.
+      try{old.close();}catch{/* New connection still proceeds. */}
+    }
+    this.options.onDisconnected();
+    this.options.onState("reconnecting","Network restored. Reconnecting to Codex…");
     this.open();
   }
 
@@ -95,6 +119,8 @@ export class RpcClient {
 
   close(): void {
     this.closed = true;
+    window.removeEventListener("online",this.networkRestored);
+    window.removeEventListener("codexdesk-network-restored",this.networkRestored);
     this.ready = false;
     if (this.retryTimer !== undefined) window.clearTimeout(this.retryTimer);
     this.socket?.close();
@@ -123,6 +149,7 @@ export class RpcClient {
     };
 
     socket.onerror = () => {
+      if(this.socket!==socket)return;
       this.options.onState(
         "reconnecting",
         "Connection interrupted. Reconnecting…",
@@ -130,7 +157,8 @@ export class RpcClient {
     };
 
     socket.onclose = () => {
-      if (this.socket === socket) this.socket = null;
+      if(this.socket!==socket)return;
+      this.socket = null;
       this.ready = false;
       this.failPending(
         new Error(

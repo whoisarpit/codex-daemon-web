@@ -28,6 +28,7 @@ export type RpcServerRequest = RpcRequest;
 export type RpcMessage = RpcReply | RpcNotification | RpcServerRequest;
 
 export type DaemonStatus = {
+  sidebar?: { projectlessThreadIds: string[]; projectThreadIds: string[] };
   authenticated: boolean;
   daemon: {
     available: boolean;
@@ -84,6 +85,10 @@ export type ThreadSummary = {
   status: ThreadStatus;
   canAcceptDirectInput: boolean | null;
   archived?: boolean;
+  projectId?: string | null;
+  parentThreadId?: string | null;
+  agentNickname?: string | null;
+  source?: string | { subAgent?: { thread_spawn?: { parent_thread_id?: string; agent_nickname?: string | null } } };
 };
 
 export type ModelOption = {
@@ -140,6 +145,7 @@ export type ScheduledTask = {
 };
 
 export type ThreadDetails = {
+  disabledPluginIds?: string[];
   cwd: string;
   model: string | null;
   approvalPolicy: unknown;

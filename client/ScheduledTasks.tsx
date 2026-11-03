@@ -26,6 +26,7 @@ type Props = {
   models: ModelOption[];
   visible: boolean;
   onCountChange: (count: number) => void;
+  onTasksChange?: (tasks: ScheduledTask[]) => void;
   onOpenThread: (threadId: string) => void;
 };
 
@@ -228,6 +229,8 @@ export default function ScheduledTasks(props: Props) {
   useEffect(() => {
     props.onCountChange(activeTaskCount);
   }, [activeTaskCount, props.onCountChange]);
+
+  useEffect(() => { props.onTasksChange?.(tasks); }, [tasks, props.onTasksChange]);
 
   function startCreate(): void {
     setSelectedTaskId(null);

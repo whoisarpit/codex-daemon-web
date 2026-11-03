@@ -9,8 +9,11 @@ import {
   Command,
   FilePlus2,
   FileText,
+  FolderInput,
   Globe,
   ImagePlus,
+  GitBranch,
+  Link2,
   LoaderCircle,
   Menu,
   MessageSquareText,
@@ -28,6 +31,8 @@ import {
   X,
 } from "lucide-react";
 import {
+  createContext,
+  useContext,
   useCallback,
   useEffect,
   useMemo,
@@ -42,8 +47,17 @@ import {
 import { createPortal } from "react-dom";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import {MarkdownCodeBlock} from "./MarkdownCodeBlock";
 import { RpcClient, type ConnectionState } from "./protocol";
 import ScheduledTasks from "./ScheduledTasks";
+import ThreadGoalPanel from "./ThreadGoalPanel";
+import FileReferenceViewer from "./FileReferenceViewer";
+import {clientUUID} from "./client-uuid";
+import {codexThreadLink,forkAtMessage} from "./conversation-actions";
+import CodexAccountPlugins from "./CodexAccountPlugins";
+import { readInterfaceLanguage, setInterfaceLanguage, type InterfaceLanguage } from "./interface-language";
+import ThreadPluginOptions from "./ThreadPluginOptions";
+import SidebarQuota from "./SidebarQuota";
 import type {
   ApprovalPrompt,
   DaemonStatus,
@@ -55,12 +69,32 @@ import type {
   ThreadItem,
   ThreadItemEntry,
   ThreadSummary,
+  ScheduledTask,
   ThreadTokenUsage,
   McpServerElicitationResponse,
   UserInput,
 } from "./types";
+import { groupSidebarThreads, readProjectPreferences, projectPreferencesKey, subagentSourceKinds, agentAncestorIds, buildAgentTreeRows, agentDisplayName, buildProjectCreateParams, type CodexProject, type ProjectPreferences, type ProjectSort, type SidebarThreadGroup } from "./project-sidebar";
+import { threadIndicator, activeSubagentParents, scheduledThreadIds } from "./thread-status";
+import { readThreadStatusPreferences, threadStatusPreferencesKey, threadStatusOrder, threadStatusLabels, defaultThreadStatusPreferences } from "./thread-status-preferences";
 import "./styles.css";
 
+type FileReferenceContextValue={
+  client:RpcClient|null;cwd:string;
+  openThread:(threadId:string)=>void;
+};
+const FileReferenceContext=createContext<FileReferenceContextValue|null>(null);
+type OptimisticSubmission = {
+  id:string;
+  threadId:string|null;
+  kind:"turn"|"steer"|"queue";
+  status:"sending"|"confirmed"|"unconfirmed";
+  input:UserInput[];
+  attachments:PendingUpload[];
+  selectedSkills:SelectedSkillReference[];
+  error?:string;
+  turnId?:string;
+};
 type TimelineItem = ThreadItemEntry & { streaming?: boolean };
 type TimelineGroup =
   | {
@@ -101,7 +135,7 @@ type PushSetupState =
 type AppNotice = { tone: "info" | "error" | "success"; text: string };
 
 type ComposerCompletionTarget = {
-  kind: "command" | "file" | "skill";
+  kind: "command" | "file" | "skill" | "mention";
   start: number;
   end: number;
   query: string;
@@ -125,6 +159,12 @@ type ComposerCompletionItem =
       name: string;
       description: string;
       path: string;
+    }
+  | {
+      kind: "plugin";
+      name: string;
+      id: string;
+      description: string;
     };
 type SelectedSkillReference = { name: string; path: string };
 type AgentIdentity = { glyph: string; color: number };
@@ -1446,12 +1486,12 @@ function completionTargetAt(
     };
   }
   const match = /(^|[\s([{])([@$])([^\s@$]*)$/.exec(prefix);
-  if (!match || (match[2] === "@" && !match[3])) return null;
+  if (!match) return null;
   const start = caret - match[2].length - match[3].length;
   const remaining = text.slice(caret);
   const following = /^[^\s@$]*/.exec(remaining)?.[0] ?? "";
   return {
-    kind: match[2] === "@" ? "file" : "skill",
+    kind: match[2] === "@" ? "mention" : "skill",
     start,
     end: caret + following.length,
     query: match[3],
@@ -1852,12 +1892,68 @@ function WorkspaceApp() {
   const [authBusy, setAuthBusy] = useState(false);
   const [authError, setAuthError] = useState("");
   const [notice, setNotice] = useState<AppNotice | null>(null);
+  const [forkBusy, setForkBusy] = useState(false);
   const noticeThreadIdRef = useRef<string | null>(null);
   const [threads, setThreads] = useState<ThreadSummary[]>([]);
+  const [subagentThreads, setSubagentThreads] = useState<ThreadSummary[]>([]);
+  const [codexProjects, setCodexProjects] = useState<CodexProject[]>([]);
+  // Official Codex project ID for a *new* conversation. Never inferred from cwd.
+  const [newProjectId,setNewProjectId] = useState("");
+  const selectNewProject=(projectId:string)=>{
+    setNewProjectId(projectId);
+    if(!projectId)return;
+    const project=codexProjects.find(entry=>entry.id===projectId);
+    const roots=project?.roots.map(entry=>entry.path).filter(Boolean)||[];
+    if(roots.length && !roots.some(root=>cwd===root||cwd.startsWith(root+"/")))
+      setCwd(roots[0]);
+  };
+  const projectOptionLabel=(project:CodexProject)=>
+    project.name+" · "+(project.roots[0]?.path||project.id);
+
+  const [projectRenameId, setProjectRenameId] = useState<string|null>(null);
+  const [projectRenameValue, setProjectRenameValue] = useState("");
+  const [projectCreateOpen, setProjectCreateOpen] = useState(false);
+  const [projectCreateName, setProjectCreateName] = useState("");
+  const [projectCreateRoot, setProjectCreateRoot] = useState("");
+  const [projectCreateIdempotencyKey, setProjectCreateIdempotencyKey] = useState("");
+  const [projectMoveThread, setProjectMoveThread] = useState<ThreadSummary|null>(null);
+  const [archiveConfirmThread,setArchiveConfirmThread]=useState<ThreadSummary|null>(null);
+  const [archiveMutationBusy,setArchiveMutationBusy]=useState(false);
+  const [projectMoveTarget, setProjectMoveTarget] = useState("");
+  const [projectMutationBusy, setProjectMutationBusy] = useState(false);
+
+  const [scheduledTasksForIndicators, setScheduledTasksForIndicators] = useState<ScheduledTask[]>([]);
+  const [failedThreadIds, setFailedThreadIds] = useState<Set<string>>(() => new Set());
+  const [threadStatusPreferences, setThreadStatusPreferences] = useState(() => {
+    try { return readThreadStatusPreferences(localStorage); }
+    catch { return readThreadStatusPreferences({getItem: () => null}); }
+  });
+  useEffect(() => {
+    try { localStorage.setItem(threadStatusPreferencesKey, JSON.stringify(threadStatusPreferences)); }
+    catch { /* Device preference storage may be unavailable. */ }
+  }, [threadStatusPreferences]);
+
+  const [collapsedSubagents, setCollapsedSubagents] = useState<Record<string, boolean>>(() => {
+    try { return JSON.parse(localStorage.getItem("codex-web.subagent-tree.v1") || "{}"); }
+    catch { return {}; }
+  });
+  useEffect(() => {
+    try { localStorage.setItem("codex-web.subagent-tree.v1", JSON.stringify(collapsedSubagents)); }
+    catch { /* Local storage may be unavailable. */ }
+  }, [collapsedSubagents]);
+
   const threadsRef = useRef<ThreadSummary[]>([]);
   const [archivedThreads, setArchivedThreads] = useState(false);
   const [threadCursor, setThreadCursor] = useState<string | null>(null);
   const [threadSearch, setThreadSearch] = useState("");
+  const [projectPreferences, setProjectPreferences] = useState<ProjectPreferences>(() => {
+    try { return readProjectPreferences(localStorage); }
+    catch { return { collapsed: {}, sort: "recent", view: "projects" }; }
+  });
+  useEffect(() => {
+    try { localStorage.setItem(projectPreferencesKey, JSON.stringify(projectPreferences)); }
+    catch { /* Keep the sidebar usable when browser storage is unavailable. */ }
+  }, [projectPreferences]);
   const [sidebarSearchOpen, setSidebarSearchOpen] = useState(false);
   const [sidebarSection, setSidebarSection] = useState<"chats" | "tasks">(
     "chats",
@@ -1883,6 +1979,7 @@ function WorkspaceApp() {
   const [threadDetails, setThreadDetails] = useState<ThreadDetails | null>(
     null,
   );
+  const [goalRevision,setGoalRevision]=useState(0);
   const [threadTokenUsage, setThreadTokenUsage] =
     useState<ThreadTokenUsage | null>(null);
   const selectedRef = useRef<string | null>(null);
@@ -1933,6 +2030,8 @@ function WorkspaceApp() {
     [],
   );
   const [items, setItems] = useState<TimelineItem[]>([]);
+  const [optimisticMessages,setOptimisticMessages]=useState<OptimisticSubmission[]>([]);
+
   const itemsRef = useRef<TimelineItem[]>([]);
   const [activityGroupOverrides, setActivityGroupOverrides] = useState<
     Record<string, boolean>
@@ -1955,6 +2054,10 @@ function WorkspaceApp() {
   const [approvalPolicy, setApprovalPolicy] = useState("");
   const [sandboxMode, setSandboxMode] = useState("");
   const [showSettings, setShowSettings] = useState(false);
+  const [interfaceLanguage,setInterfaceLanguageChoice] = useState<InterfaceLanguage>(readInterfaceLanguage);
+  useEffect(()=>{setInterfaceLanguage(interfaceLanguage);},[interfaceLanguage]);
+  const [showOptions, setShowOptions] = useState(false);
+  const [disabledPluginIds, setDisabledPluginIds] = useState<string[]>([]);
   const [newVersionAvailable, setNewVersionAvailable] = useState(false);
   const [completionSoundEnabled, setCompletionSoundEnabled] = useState(
     readCompletionSoundPreference,
@@ -1988,6 +2091,9 @@ function WorkspaceApp() {
   const completionRequestRef = useRef(0);
   const skillsCacheRef = useRef(
     new Map<string, SkillsListResponse["data"][number]["skills"]>(),
+  );
+  const pluginsCacheRef=useRef(
+    new Map<string,Extract<ComposerCompletionItem,{kind:"plugin"}>[]>(),
   );
   const [uploads, setUploads] = useState<PendingUpload[]>([]);
   const uploadsRef = useRef(uploads);
@@ -2040,6 +2146,7 @@ function WorkspaceApp() {
     Record<string, string[]>
   >({});
   const { client, connection, connectionMessage, attach, detach } = useRpc();
+  useEffect(()=>{pluginsCacheRef.current.clear();},[client]);
   const handlersRef = useRef({
     onNotification: (_method: string, _params: Record<string, unknown>) => {},
     onServerRequest: (_request: ApprovalPrompt) => {},
@@ -2560,7 +2667,8 @@ function WorkspaceApp() {
           data: ThreadSummary[];
           nextCursor: string | null;
         }>("thread/list", {
-          limit: 40,
+          limit: 100,
+          sourceKinds: ["cli", "vscode", "appServer"],
           sortKey: archived ? "updated_at" : "recency_at",
           sortDirection: "desc",
           archived,
@@ -2576,6 +2684,29 @@ function WorkspaceApp() {
           mergeThreadPage(current, data, append, !archived),
         );
         setThreadCursor(result.nextCursor);
+        // The daemon excludes spawned agents from default thread/list results.
+        // Fetch agent sources independently so normal conversation pagination is unchanged.
+        try {
+          const agents: ThreadSummary[] = [];
+          let cursor: string | null = null;
+          for (let page = 0; page < 20; page++) {
+            const batch: { data: ThreadSummary[]; nextCursor: string | null } = await rpc.request("thread/list", {
+              limit: 100,
+              archived,
+              sortKey: archived ? "updated_at" : "recency_at",
+              sortDirection: "desc",
+              sourceKinds: subagentSourceKinds,
+              ...(cursor ? { cursor } : {}),
+            });
+            agents.push(...batch.data);
+            cursor = batch.nextCursor;
+            if (!cursor) break;
+          }
+          setSubagentThreads(agents);
+        } catch (error) {
+          console.warn("Unable to load subagent threads", error);
+        }
+
       } catch (error) {
         setNotice({
           tone: "error",
@@ -2585,6 +2716,100 @@ function WorkspaceApp() {
     },
     [archivedThreads, threadCursor],
   );
+
+  const refreshProjects = useCallback(async (rpc: RpcClient) => {
+    try {
+      const projects: CodexProject[] = [];
+      let cursor: string | null = null;
+      for (let page = 0; page < 20; page++) {
+        const result: {data: CodexProject[];nextCursor:string|null} = await rpc.request("project/list",{
+          limit:100,...(cursor?{cursor}:{}),
+        });
+        projects.push(...result.data);
+        cursor=result.nextCursor;
+        if (!cursor) break;
+      }
+      setCodexProjects(projects);
+    } catch (error) {
+      setNotice({tone:"error",text:"Could not load Codex projects: "+shortError(error)});
+    }
+  },[]);
+  useEffect(() => {
+    if (!client || connection !== "online") return;
+    void refreshProjects(client);
+  }, [client,connection,refreshProjects]);
+
+  const openProjectCreate = () => {
+    setProjectCreateName("");
+    setProjectCreateRoot(selectedThread?.cwd || cwd || "");
+    setProjectCreateIdempotencyKey(clientUUID());
+    setProjectCreateOpen(true);
+  };
+  const createCodexProject = async () => {
+    const name=projectCreateName.trim();
+    const root=projectCreateRoot.trim();
+    if(!client||!name||!root||projectMutationBusy)return;
+    let params;
+    try { params=buildProjectCreateParams(name,root,projectCreateIdempotencyKey); }
+    catch(error) { setNotice({tone:"error",text:shortError(error)}); return; }
+    setProjectMutationBusy(true);
+    try {
+      const result=await client.request<{project:CodexProject}>("project/create",params);
+      if(!result?.project?.id)throw new Error("Codex did not return the created project.");
+      setCodexProjects(current=>[result.project,...current.filter(project=>project.id!==result.project.id)]);
+      setNewProjectId(result.project.id);
+      setCwd(root);
+      setProjectCreateOpen(false);
+      setProjectCreateIdempotencyKey("");
+      setNotice({tone:"success",text:"Created Codex project: "+result.project.name});
+      void refreshProjects(client);
+    } catch(error) {
+      setNotice({tone:"error",text:"Could not create project: "+shortError(error)});
+    } finally {
+      setProjectMutationBusy(false);
+    }
+  };
+
+  const renameCodexProject = async (projectId:string) => {
+    const name=projectRenameValue.trim();
+    if(!client||!name||projectMutationBusy)return;
+    setProjectMutationBusy(true);
+    try {
+      await client.request("project/update",{projectId,name});
+      setCodexProjects(old=>old.map(p=>p.id===projectId?{...p,name}:p));
+      setProjectRenameId(null);
+      void refreshProjects(client);
+    } catch(error) {setNotice({tone:"error",text:"Could not rename project: "+shortError(error)});}
+    finally {setProjectMutationBusy(false);}
+  };
+  const moveConversationToProject = async () => {
+    if (!client || !projectMoveThread || projectMutationBusy) return;
+    const threadId=projectMoveThread.id;
+    const projectId=projectMoveTarget;
+    setProjectMutationBusy(true);
+    try {
+      await client.request("thread/metadata/update",{threadId,projectId});
+      const patch=(t:ThreadSummary)=>t.id===threadId?{...t,projectId:projectId||null}:t;
+      setThreads(current=>current.map(patch));
+      threadsRef.current=threadsRef.current.map(patch);
+      setSubagentThreads(current=>current.map(patch));
+      setSelectedThread(current=>current?.id===threadId?patch(current):current);
+      setProjectMoveThread(null);
+      if (client) {void refreshProjects(client);void refreshThreads(client,archivedThreads,false);}
+    } catch(error){setNotice({tone:"error",text:"Could not change project: "+shortError(error)});}
+    finally{setProjectMutationBusy(false);}
+  };
+
+  // Other daemon clients (notably Codex Desktop) may own the active thread.
+  // Poll its persisted status so sidebar indicators don't depend on this
+  // browser receiving that thread's turn notifications.
+  useEffect(() => {
+    if (!client || connection !== "online") return;
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === "visible") void refreshThreads(client, archivedThreads, false);
+    }, 20_000);
+    return () => window.clearInterval(timer);
+  }, [client, connection, archivedThreads, refreshThreads]);
 
   const loadModels = useCallback(
     async (rpc: RpcClient) => {
@@ -2744,6 +2969,11 @@ function WorkspaceApp() {
         return;
       }
 
+      if (method === "thread/goal/updated" || method === "thread/goal/cleared") {
+        if(asString(params.threadId)===selectedRef.current)
+          setGoalRevision(value=>value+1);
+        return;
+      }
       if (method === "thread/queue/changed") {
         const threadId = asString(params.threadId);
         if (threadId && threadId === selectedRef.current && client)
@@ -2789,6 +3019,21 @@ function WorkspaceApp() {
       }
 
       const threadId = asString(params.threadId);
+      if (threadId && method === "turn/started") {
+        setFailedThreadIds((old) => {
+          if (!old.has(threadId)) return old;
+          const updated = new Set(old); updated.delete(threadId); return updated;
+        });
+      }
+      if (threadId && method === "turn/completed" && isRecord(params.turn)) {
+        const failed = params.turn.status === "failed";
+        setFailedThreadIds((old) => {
+          if (failed === old.has(threadId)) return old;
+          const updated = new Set(old);
+          if (failed) updated.add(threadId); else updated.delete(threadId);
+          return updated;
+        });
+      }
       if (method === "turn/started" && client)
         void refreshThreads(client, archivedThreads, false);
       if (threadId && threadId !== selectedRef.current) return;
@@ -3063,6 +3308,7 @@ function WorkspaceApp() {
                 thread: { ...response.thread, name: confirmedName },
               };
         setThreadDetails(detailsResponse);
+        setDisabledPluginIds(Array.isArray(response.disabledPluginIds) ? response.disabledPluginIds : []);
         void refreshThreadQueue(rpc, threadId);
         setCwd(response.cwd || summary?.cwd || "");
         setModel(response.model || summary?.model || "");
@@ -3080,8 +3326,10 @@ function WorkspaceApp() {
             isRecord(response.thread.status) &&
             response.thread.status.type === "active",
         };
-        if (response.thread.canAcceptDirectInput === false)
+        if (response.thread.canAcceptDirectInput === false) {
           setShowSettings(false);
+          setShowOptions(false);
+        }
         setSelectedThread((current) => {
           if (
             version !== loadVersionRef.current ||
@@ -3174,6 +3422,13 @@ function WorkspaceApp() {
           }),
         ]);
         if (version !== loadVersionRef.current) return;
+        setFailedThreadIds((current) => {
+          const failed = turnPage.data[0]?.status === "failed";
+          if (failed === current.has(threadId)) return current;
+          const next = new Set(current);
+          if (failed) next.add(threadId); else next.delete(threadId);
+          return next;
+        });
         const sorted = [...page.data].reverse().map((entry) => ({ ...entry }));
         const merged = mergeHistoryWithLive(
           sorted,
@@ -3271,6 +3526,47 @@ function WorkspaceApp() {
       updateThreadTrail,
     ],
   );
+
+  const copyConversationLink = async (threadId:string) => {
+    try {
+      const link=codexThreadLink(threadId);
+      if(navigator.clipboard?.writeText){
+        try { await navigator.clipboard.writeText(link); }
+        catch {
+          const input=document.createElement("textarea");
+          input.value=link;input.style.position="fixed";input.style.opacity="0";
+          document.body.appendChild(input);input.select();
+          const copied=document.execCommand("copy");input.remove();
+          if(!copied)throw new Error("Clipboard permission denied.");
+        }
+      } else {
+        const input=document.createElement("textarea");
+        input.value=link;input.style.position="fixed";input.style.opacity="0";
+        document.body.appendChild(input);input.select();
+        const copied=document.execCommand("copy");input.remove();
+        if(!copied)throw new Error("Clipboard is unavailable.");
+      }
+      setNotice({tone:"success",text:"Codex thread reference copied."});
+    }catch(error){
+      setNotice({tone:"error",text:"Could not copy link: "+shortError(error)});
+    }
+  };
+  const forkConversationAtMessage = async (entry:TimelineItem) => {
+    if(!client||!selectedThread?.id||!entry.turnId||entry.streaming||forkBusy)return;
+    if(entry.item.type!=="userMessage"&&entry.item.type!=="agentMessage")return;
+    setForkBusy(true);
+    try{
+      const params=forkAtMessage(selectedThread.id,entry.turnId,entry.item.type);
+      const result=await client.request<{thread:{id:string}}>("thread/fork",params);
+      const id=result?.thread?.id;
+      if(!id)throw new Error("Codex did not return a forked thread.");
+      await navigateToThread(id,[],"push");
+      void refreshThreads(client,false,false);
+      setNotice({tone:"success",text:"Conversation fork created."});
+    }catch(error){
+      setNotice({tone:"error",text:"Could not fork conversation: "+shortError(error)});
+    }finally{setForkBusy(false);}
+  };
 
   const openAgentThread = useCallback(
     (threadId: string, parentThreadId?: string) => {
@@ -3613,6 +3909,8 @@ function WorkspaceApp() {
     sessionStorage.removeItem(selectedThreadKey);
     setSelectedThread(null);
     setThreadDetails(null);
+    setNewProjectId(selectedThread?.projectId || "");
+    setDisabledPluginIds([]);
     setItems([]);
     itemsRef.current = [];
     liveItemsRef.current.clear();
@@ -3782,17 +4080,54 @@ function WorkspaceApp() {
   const filteredThreads = useMemo(() => {
     const query = threadSearch.toLowerCase().trim();
     if (!query) return threads;
+    const agentAncestors = agentAncestorIds(subagentThreads, query);
     return threads.filter((thread) =>
+      agentAncestors.has(thread.id) ||
       `${titleFor(thread)} ${thread.preview} ${thread.cwd}`
         .toLowerCase()
         .includes(query),
     );
-  }, [threadSearch, threads]);
+  }, [threadSearch, threads, subagentThreads]);
+  const scheduledIndicatorIds = useMemo(() => scheduledThreadIds(scheduledTasksForIndicators), [scheduledTasksForIndicators]);
+  const activeChildParentIds = useMemo(() => activeSubagentParents(subagentThreads), [subagentThreads]);
+  const pendingDecisionIds = useMemo(() => new Set(approvalQueue.map((prompt) => asString(prompt.params.threadId)).filter(Boolean)), [approvalQueue]);
+  const statusForThread = useCallback((thread: ThreadSummary) => threadIndicator(thread, {
+    pendingDecision: pendingDecisionIds.has(thread.id),
+    activeChild: activeChildParentIds.has(thread.id),
+    scheduled: scheduledIndicatorIds.has(thread.id),
+    failedTurn: failedThreadIds.has(thread.id),
+  }).kind, [pendingDecisionIds,activeChildParentIds,scheduledIndicatorIds,failedThreadIds]);
+  const projectGroups: SidebarThreadGroup[] = useMemo(
+    () => groupSidebarThreads(filteredThreads,codexProjects,projectPreferences.sort,archivedThreads,
+      projectPreferences.view,statusForThread),
+    [filteredThreads,codexProjects,projectPreferences.sort,projectPreferences.view,archivedThreads,status?.sidebar,statusForThread],
+  );
+
   useEffect(() => {
     if (sidebarSearchOpen && sidebarSection === "chats")
       sidebarSearchRef.current?.focus();
   }, [sidebarSearchOpen, sidebarSection]);
   const timelineGrouping = useMemo(() => groupTimelineItems(items), [items]);
+  // Match by the official clientUserMessageId; this prevents duplicate local
+  // and daemon bubbles even when item notifications arrive before the RPC reply.
+  const deliveredClientIds=useMemo(()=>new Set(items
+    .filter(entry=>entry.item.type==="userMessage"&&typeof entry.item.clientId==="string")
+    .map(entry=>entry.item.clientId as string)),[items]);
+  const isOptimisticDelivered=(message:OptimisticSubmission)=>
+    deliveredClientIds.has(message.id) ||
+    (message.kind==="turn" && !!message.turnId && items.some(entry=>
+      entry.item.type==="userMessage"&&entry.turnId===message.turnId));
+  const visibleOptimistic=optimisticMessages.filter(message=>
+    !isOptimisticDelivered(message) &&
+    (message.threadId===selectedThread?.id ||
+      (message.threadId===null && !selectedThread && route.kind==="new"))
+  );
+  useEffect(()=>{
+    const completedIds=new Set(optimisticMessages.filter(isOptimisticDelivered).map(m=>m.id));
+    if(completedIds.size)
+      setOptimisticMessages(current=>current.filter(m=>!completedIds.has(m.id)));
+  },[items,optimisticMessages]);
+
 
   useEffect(() => {
     const requestId = ++completionRequestRef.current;
@@ -3829,15 +4164,6 @@ function WorkspaceApp() {
       setCompletionError("");
       return;
     }
-    if (target.kind === "file" && (!completionCwd || !target.query)) {
-      setCompletionItems([]);
-      setCompletionLoading(false);
-      setCompletionError(
-        completionCwd ? "" : "Set a working directory to search files.",
-      );
-      return;
-    }
-
     setCompletionItems([]);
     setCompletionIndex(0);
     setCompletionLoading(true);
@@ -3845,35 +4171,59 @@ function WorkspaceApp() {
     let sentFileSearch = false;
     const timer = window.setTimeout(
       () => {
-        if (target.kind === "file") {
-          sentFileSearch = true;
-          void client
-            .request<{ files: FuzzyFileSearchResult[] }>("fuzzyFileSearch", {
-              query: target.query,
-              roots: [completionCwd],
-              cancellationToken: "codex-daemon-web-composer",
-            })
-            .then((response) => {
-              if (completionRequestRef.current !== requestId) return;
-              setCompletionItems(
-                response.files.map((file) => ({
-                  kind: "file" as const,
-                  path: file.path,
-                  label:
-                    file.path.startsWith(`${file.root}/`) ||
-                    file.path.startsWith(`${file.root}\\`)
-                      ? file.path.slice(file.root.length + 1)
-                      : file.path,
-                  isDirectory: file.match_type === "directory",
-                })),
-              );
-              setCompletionLoading(false);
-            })
-            .catch((error: unknown) => {
-              if (completionRequestRef.current !== requestId) return;
-              setCompletionError(shortError(error));
-              setCompletionLoading(false);
-            });
+        if (target.kind === "mention") {
+          const cacheKey=completionCwd||"__global__";
+          const cached=pluginsCacheRef.current.get(cacheKey);
+          const loadPlugins=cached
+            ? Promise.resolve(cached)
+            : client.request<{marketplaces:Array<{plugins:Array<{
+                id:string;name:string;installed:boolean;enabled:boolean;
+                interface?:{displayName?:string|null;shortDescription?:string|null}|null;
+              }>}>}>("plugin/installed",{
+                ...(completionCwd?{cwds:[completionCwd]}:{}),
+              }).then(response=>{
+                const byId=new Map<string,Extract<ComposerCompletionItem,{kind:"plugin"}>>();
+                for(const marketplace of response.marketplaces||[])
+                  for(const plugin of marketplace.plugins||[]){
+                    if(!plugin.installed||!plugin.enabled||!/^[a-zA-Z0-9_.@-]+$/.test(plugin.id))continue;
+                    const name=plugin.interface?.displayName?.trim()||plugin.name;
+                    byId.set(plugin.id,{
+                      kind:"plugin",name,id:plugin.id,
+                      description:plugin.interface?.shortDescription||plugin.name,
+                    });
+                  }
+                const list=[...byId.values()].sort((a,b)=>a.name.localeCompare(b.name));
+                pluginsCacheRef.current.set(cacheKey,list);
+                return list;
+              });
+          // @ lists installed plugins immediately; @query also searches cwd files.
+          const fileRequest=completionCwd&&target.query
+            ? (sentFileSearch=true,client.request<{files:FuzzyFileSearchResult[]}>(
+                "fuzzyFileSearch",{
+                  query:target.query,roots:[completionCwd],
+                  cancellationToken:"codex-daemon-web-composer",
+                }).then(response=>response.files.slice(0,30).map(file=>({
+                  kind:"file" as const,path:file.path,
+                  label:file.path.startsWith(file.root+"/")||file.path.startsWith(file.root+"\\")
+                    ? file.path.slice(file.root.length+1):file.path,
+                  isDirectory:file.match_type==="directory",
+                }))).catch(()=>[]))
+            : Promise.resolve([] as Extract<ComposerCompletionItem,{kind:"file"}>[]);
+          void Promise.allSettled([loadPlugins,fileRequest]).then(results=>{
+            if(completionRequestRef.current!==requestId)return;
+            const plugins=results[0].status==="fulfilled"?results[0].value:[];
+            const files=results[1].status==="fulfilled"?results[1].value:[];
+            const query=target.query.toLocaleLowerCase();
+            const matching=plugins.filter(plugin=>
+              !disabledPluginIds.includes(plugin.id) && (!query||
+              plugin.name.toLocaleLowerCase().includes(query)||
+              plugin.description.toLocaleLowerCase().includes(query)||
+              plugin.id.toLocaleLowerCase().includes(query)));
+            setCompletionItems([...matching,...files]);
+            if(results[0].status==="rejected"&&!files.length)
+              setCompletionError(shortError(results[0].reason));
+            setCompletionLoading(false);
+          });
           return;
         }
 
@@ -3922,7 +4272,7 @@ function WorkspaceApp() {
             setCompletionLoading(false);
           });
       },
-      target.kind === "file" ? 140 : 80,
+      target.kind === "mention" ? 110 : 80,
     );
 
     return () => {
@@ -3953,6 +4303,7 @@ function WorkspaceApp() {
     selectedThread?.canAcceptDirectInput,
     sending,
     skillsRevision,
+    disabledPluginIds,
     turnActive,
   ]);
 
@@ -4001,11 +4352,13 @@ function WorkspaceApp() {
           : item.path
         : item.kind === "skill"
           ? `$${item.name}`
-          : item.command;
+          : item.kind === "plugin"
+            ? `[@${item.name.replace(/[\[\]\n\r]/g,"")}](plugin://${item.id})`
+            : item.command;
     const suffix = composer.slice(completionTarget.end);
     const hasSeparator = /^\s/u.test(suffix);
     const separator = hasSeparator ? suffix : ` ${suffix}`;
-    const caret = completionTarget.start + inserted.length + 1;
+    const caret = completionTarget.start + inserted.length + (hasSeparator?0:1);
     const nextText =
       composer.slice(0, completionTarget.start) + inserted + separator;
     if (item.kind === "skill")
@@ -4038,6 +4391,51 @@ function WorkspaceApp() {
     setComposer("");
     if (composerRef.current) composerRef.current.style.height = "39px";
   };
+  const beginOptimistic=(message:OptimisticSubmission,sourceText:string)=>{
+    setOptimisticMessages(current=>[...current.filter(item=>item.id!==message.id),message]);
+    scrollWasNearBottom.current=true;
+    // Acknowledge the click visually before waiting for Codex's RPC response.
+    if((composerRef.current?.value??sourceText)===sourceText)clearComposerText();
+    clearUploadsIfUnchanged(message.attachments);
+  };
+  const changeOptimistic=(id:string,update:Partial<OptimisticSubmission>)=>{
+    setOptimisticMessages(current=>current.map(item=>item.id===id?{...item,...update}:item));
+  };
+  const restoreOptimistic=async(message:OptimisticSubmission)=>{
+    if(message.threadId && client){
+      try{
+        if(await threadHasClientMessage(client,message.threadId,message.id,itemsRef.current)){
+          setOptimisticMessages(current=>current.filter(item=>item.id!==message.id));
+          setNotice({tone:"info",text:"Codex already received this message. No retry is needed."});
+          return;
+        }
+        if(message.kind==="queue"){
+          const queue=await listThreadQueue(client,message.threadId);
+          if(queue.some(entry=>entry.clientUserMessageId===message.id)){
+            setOptimisticMessages(current=>current.filter(item=>item.id!==message.id));
+            setNotice({tone:"info",text:"This message is already in the queue. No retry is needed."});
+            void refreshThreadQueue(client,message.threadId);
+            return;
+          }
+        }
+      }catch(error){
+        setNotice({tone:"error",text:"Could not check delivery; the draft was not restored. "+shortError(error)});
+        return;
+      }
+    }
+    if((message.threadId||null)!==(selectedThread?.id||null)){
+      setNotice({tone:"info",text:"Open the original conversation before restoring this draft."});
+      return;
+    }
+    const text=message.input.filter(part=>part.type==="text").map(part=>part.type==="text"?part.text:"").join("\n");
+    setComposer(current=>current.trim()?current+"\n"+text:text);
+    updateUploads(current=>[...current,...message.attachments.filter(upload=>!current.some(x=>x.id===upload.id))]);
+    selectedSkillsRef.current=[...selectedSkillsRef.current,...message.selectedSkills];
+    setOptimisticMessages(current=>current.filter(item=>item.id!==message.id));
+    setNotice({tone:"info",text:"Draft restored. Verify it was not delivered before sending again."});
+    requestAnimationFrame(()=>composerRef.current?.focus());
+  };
+
 
   const runNewConversationCommand = () => {
     setCompletionTarget(null);
@@ -4192,6 +4590,7 @@ function WorkspaceApp() {
     let threadId = selectedThread?.id;
     const threadIdAtSend = threadId ?? null;
     const turnIdAtSend = activeTurnId;
+    let optimisticId:string|null=null;
     try {
       const input = userInputFromDraft(
         composerAtSend,
@@ -4210,7 +4609,7 @@ function WorkspaceApp() {
         const clientUserMessageId =
           steerAttemptRef.current?.key === attemptKey
             ? steerAttemptRef.current.clientUserMessageId
-            : crypto.randomUUID();
+            : clientUUID();
         steerAttemptRef.current = { key: attemptKey, clientUserMessageId };
         const steerParams = {
           threadId: threadIdAtSend!,
@@ -4226,22 +4625,16 @@ function WorkspaceApp() {
           });
           return;
         }
+        optimisticId=clientUserMessageId;
+        beginOptimistic({
+          id:clientUserMessageId,threadId:threadIdAtSend,
+          kind:"steer",status:"sending",input,
+          attachments:uploadsAtSend,selectedSkills:selectedSkillsAtSend,
+        },composerAtSend);
         await client.request<{ turnId: string }>("turn/steer", steerParams);
+        changeOptimistic(clientUserMessageId,{status:"confirmed"});
+        steerAttemptRef.current=null;
         void refreshThreads(client, archivedThreads, false);
-        if (
-          selectedRef.current === threadIdAtSend &&
-          loadVersionRef.current === loadVersionAtSend
-        ) {
-          const composerUnchanged =
-            (composerRef.current?.value ?? composerAtSend) === composerAtSend;
-          if (composerUnchanged) {
-            setComposer("");
-            if (composerRef.current) composerRef.current.style.height = "39px";
-          }
-          clearUploadsIfUnchanged(uploadsAtSend);
-          if (composerUnchanged && uploadsRef.current.length === 0)
-            steerAttemptRef.current = null;
-        }
         setNotice({
           tone: "success",
           text: "Direction sent to the active turn.",
@@ -4249,8 +4642,11 @@ function WorkspaceApp() {
         return;
       }
 
+      const directMessageId=clientUUID();
       const turnParams: Record<string, unknown> = {
         threadId: threadId ?? "00000000-0000-0000-0000-000000000000",
+        disabledPluginIds,
+        clientUserMessageId:directMessageId,
         input,
       };
       if (model) turnParams.model = model;
@@ -4287,10 +4683,18 @@ function WorkspaceApp() {
         return;
       }
 
+      optimisticId=directMessageId;
+      beginOptimistic({
+        id:directMessageId,threadId:threadIdAtSend,
+        kind:"turn",status:"sending",input,
+        attachments:uploadsAtSend,selectedSkills:selectedSkillsAtSend,
+      },composerAtSend);
+
       if (!threadId) {
         const startParams: Record<string, unknown> = {};
         if (model) startParams.model = model;
         if (cwd.trim()) startParams.cwd = cwd.trim();
+        if (newProjectId) startParams.projectId = newProjectId;
         if (approvalPolicy) startParams.approvalPolicy = approvalPolicy;
         if (sandboxMode) startParams.sandbox = sandboxMode;
         const started = await client.request<{
@@ -4310,6 +4714,7 @@ function WorkspaceApp() {
           return;
         threadId = started.thread.id;
         turnParams.threadId = threadId;
+        changeOptimistic(directMessageId,{threadId});
         const startedRoute: ConversationRoute = {
           kind: "thread",
           threadId,
@@ -4351,6 +4756,7 @@ function WorkspaceApp() {
       const response = await client.request<{
         turn: { id: string; status: string };
       }>("turn/start", turnParams);
+      changeOptimistic(directMessageId,{status:"confirmed",turnId:response.turn.id});
       if (selectedRef.current === threadId) {
         if (response.turn.status === "inProgress")
           eligibleCompletionTurnIdsRef.current.add(response.turn.id);
@@ -4361,14 +4767,11 @@ function WorkspaceApp() {
           turnId: response.turn.id,
           active: response.turn.status === "inProgress",
         };
-        if ((composerRef.current?.value ?? composerAtSend) === composerAtSend) {
-          setComposer("");
-          if (composerRef.current) composerRef.current.style.height = "39px";
-        }
-        clearUploadsIfUnchanged(uploadsAtSend);
-        setShowSettings(false);
+        setShowOptions(false);
       }
     } catch (error) {
+      if(optimisticId)
+        changeOptimistic(optimisticId,{status:"unconfirmed",error:shortError(error)});
       setNotice({
         tone: "error",
         text: shouldSteer
@@ -4446,7 +4849,7 @@ function WorkspaceApp() {
     const clientUserMessageId =
       queueAttemptRef.current?.key === attemptKey
         ? queueAttemptRef.current.clientUserMessageId
-        : crypto.randomUUID();
+        : clientUUID();
     queueAttemptRef.current = { key: attemptKey, clientUserMessageId };
     const params = { threadId: threadIdAtQueue, input, clientUserMessageId };
     const requestBytes = serializedRequestBytes("thread/queue/add", params);
@@ -4461,12 +4864,18 @@ function WorkspaceApp() {
     queueingRef.current = true;
     setQueueing(true);
     setNotice(null);
+    beginOptimistic({
+      id:clientUserMessageId,threadId:threadIdAtQueue,
+      kind:"queue",status:"sending",input,
+      attachments:uploadsAtQueue,selectedSkills:selectedSkillsAtQueue,
+    },textAtQueue);
     try {
       const result = await client.request<{
         queuedSubmission: QueuedSubmission;
       }>("thread/queue/add", params);
       if (!result.queuedSubmission?.id)
         throw new Error("The daemon did not confirm the queued reply.");
+      setOptimisticMessages(current=>current.filter(item=>item.id!==clientUserMessageId));
       if (
         selectedRef.current === threadIdAtQueue &&
         loadVersionRef.current === loadVersionAtQueue
@@ -4482,32 +4891,13 @@ function WorkspaceApp() {
         );
         void refreshThreadQueue(client, threadIdAtQueue);
       }
-      let clearedDraft = false;
-      if (
-        selectedRef.current === threadIdAtQueue &&
-        loadVersionRef.current === loadVersionAtQueue
-      ) {
-        const composerUnchanged =
-          (composerRef.current?.value ?? textAtQueue) === textAtQueue;
-        const uploadIdsAtQueue = uploadsAtQueue
-          .map((upload) => upload.id)
-          .join("\u0000");
-        const uploadsUnchanged =
-          uploadsRef.current.map((upload) => upload.id).join("\u0000") ===
-          uploadIdsAtQueue;
-        if (composerUnchanged) {
-          setComposer("");
-          if (composerRef.current) composerRef.current.style.height = "39px";
-        }
-        clearUploadsIfUnchanged(uploadsAtQueue);
-        clearedDraft = composerUnchanged && uploadsUnchanged;
-      }
-      if (clearedDraft) queueAttemptRef.current = null;
+      queueAttemptRef.current = null;
       setNotice({
         tone: "success",
         text: `Reply queued for ${threadTitleAtQueue}. It will run after the active turn.`,
       });
     } catch (error) {
+      changeOptimistic(clientUserMessageId,{status:"unconfirmed",error:shortError(error)});
       setNotice({
         tone: "error",
         text: `Could not confirm that the reply was queued. Check the thread queue before retrying. ${shortError(error)}`,
@@ -4993,27 +5383,37 @@ function WorkspaceApp() {
   );
 
   const archiveThread = async (thread: ThreadSummary) => {
-    if (!client) return;
+    if (!client || archiveMutationBusy) return;
+    // Never mutate the archive state on the first click: all archive entry
+    // points (sidebar row and context menu, including subagents) use this.
+    if (!archivedThreads) {
+      setArchiveConfirmThread(thread);
+      return;
+    }
     try {
-      await client.request(
-        archivedThreads ? "thread/unarchive" : "thread/archive",
-        { threadId: thread.id },
-      );
-      setThreads((current) =>
-        current.filter((entry) => entry.id !== thread.id),
-      );
-      if (selectedThread?.id === thread.id) newConversation();
-      setNotice({
-        tone: "success",
-        text: archivedThreads
-          ? "Conversation restored."
-          : "Conversation archived.",
-      });
-    } catch (error) {
-      setNotice({
-        tone: "error",
-        text: `Could not update conversation: ${shortError(error)}`,
-      });
+      await client.request("thread/unarchive",{threadId:thread.id});
+      setThreads(current=>current.filter(entry=>entry.id!==thread.id));
+      if(selectedThread?.id===thread.id)newConversation();
+      setNotice({tone:"success",text:"Conversation restored."});
+    }catch(error){
+      setNotice({tone:"error",text:`Could not restore conversation: ${shortError(error)}`});
+    }
+  };
+
+  const confirmArchiveThread = async () => {
+    const thread=archiveConfirmThread;
+    if(!client||!thread||archiveMutationBusy)return;
+    setArchiveMutationBusy(true);
+    try{
+      await client.request("thread/archive",{threadId:thread.id});
+      setArchiveConfirmThread(null);
+      setThreads(current=>current.filter(entry=>entry.id!==thread.id));
+      if(selectedThread?.id===thread.id)newConversation();
+      setNotice({tone:"success",text:"Conversation archived."});
+    }catch(error){
+      setNotice({tone:"error",text:`Could not archive conversation: ${shortError(error)}`});
+    }finally{
+      setArchiveMutationBusy(false);
     }
   };
 
@@ -5091,7 +5491,7 @@ function WorkspaceApp() {
       const converted: PendingUpload[] = [];
       for (const file of accepted) {
         converted.push({
-          id: crypto.randomUUID(),
+          id: clientUUID(),
           name: file.name || "Pasted image",
           dataUrl: await compressImage(file),
           size: file.size,
@@ -5178,7 +5578,7 @@ function WorkspaceApp() {
     const view = timelineRef.current;
     if (!view) return;
     if (scrollWasNearBottom.current) view.scrollTop = view.scrollHeight;
-  }, [items]);
+  }, [items,visibleOptimistic.length]);
 
   if (booting) return <LoadingScreen label="Connecting your workspace" />;
   if (!status && statusError) {
@@ -5197,6 +5597,8 @@ function WorkspaceApp() {
         busy={authBusy}
         error={authError || statusError}
         onSubmit={signIn}
+        language={interfaceLanguage}
+        setLanguage={setInterfaceLanguageChoice}
       />
     );
   }
@@ -5347,6 +5749,7 @@ function WorkspaceApp() {
           models={models}
           visible={sidebarSection === "tasks"}
           onCountChange={setScheduleCount}
+          onTasksChange={setScheduledTasksForIndicators}
           onOpenThread={(threadId) => navigateToThread(threadId, [], "push")}
         />
 
@@ -5385,6 +5788,46 @@ function WorkspaceApp() {
               </button>
             </div>
           ) : null}
+          <label className="project-sort">
+            <span>View</span>
+            <select aria-label="Conversation list view"
+              value={projectPreferences.view}
+              onChange={(event)=>setProjectPreferences(current=>({
+                ...current, view: event.target.value==="status"?"status":"projects",
+              }))}>
+              <option value="projects">Projects</option>
+              <option value="status">Work status</option>
+            </select>
+          </label>
+          {projectPreferences.view === "projects" ? <label className="project-sort">
+            <span>Sort</span>
+            <select
+              aria-label="Sort projects"
+              value={projectPreferences.sort}
+              onChange={(event) => setProjectPreferences((current) => ({
+                ...current, sort: event.target.value as ProjectSort,
+              }))}
+            >
+              <option value="recent">Recent activity</option>
+              <option value="name">Project name</option>
+            </select>
+          </label> : null}
+          {!archivedThreads ? (
+            <button type="button" className="project-create-trigger" onClick={openProjectCreate}>
+              <Plus size={14} aria-hidden="true" />
+              <span>New project</span>
+            </button>
+          ) : null}
+          <div className="thread-status-legend" aria-label="Conversation status legend">
+            {threadStatusOrder.filter((kind) => threadStatusPreferences[kind].enabled).map((kind) => (
+              <span key={kind}>
+                <i className="thread-status-indicator" style={{
+                  backgroundColor: threadStatusPreferences[kind].color,
+                  borderRadius: threadStatusPreferences[kind].shape === "circle" ? "50%" : "2px",
+                }} />{threadStatusLabels[kind]}
+              </span>
+            ))}
+          </div>
           {filteredThreads.length === 0 ? (
             <div className="thread-list-empty">
               {threadSearch
@@ -5394,126 +5837,208 @@ function WorkspaceApp() {
                   : "Your recent work will appear here"}
             </div>
           ) : (
-            filteredThreads.map((thread) => {
-              const activityTimestamp = threadActivityTimestamp(
-                thread,
-                archivedThreads,
-              );
-              const activityTime = formatThreadActivityTime(activityTimestamp);
+            projectGroups.map((group) => {
+              const expanded = Boolean(threadSearch.trim()) || !projectPreferences.collapsed[group.cwd];
               return (
-                <div
-                  key={thread.id}
-                  className={`thread-row ${selectedThread?.id === thread.id ? "selected" : ""}`}
-                >
-                  {renameId === thread.id ? (
-                    <form
-                      className="rename-form"
-                      onSubmit={(event) => {
-                        event.preventDefault();
-                        void saveRename(thread.id);
-                      }}
-                    >
-                      <input
-                        autoFocus
-                        value={renameValue}
-                        onChange={(event) => setRenameValue(event.target.value)}
-                        onKeyDown={(event) => {
-                          if (event.key === "Escape") setRenameId(null);
-                        }}
-                        aria-label="Conversation name"
-                      />
-                      <button aria-label="Save name">
-                        <Check size={15} />
-                      </button>
-                    </form>
-                  ) : (
-                    <>
-                      <button
-                        className="thread-select"
-                        aria-haspopup="menu"
-                        aria-expanded={
-                          threadContextMenu?.thread.id === thread.id
-                        }
-                        title="Right-click or long-press for conversation actions"
-                        onClick={(event) => {
-                          handleThreadSelectClick(event, thread);
-                        }}
-                        onDoubleClick={(event) => {
-                          event.preventDefault();
-                          renameThread(thread);
-                        }}
-                        onContextMenu={(event) =>
-                          handleThreadContextMenu(event, thread)
-                        }
-                        onKeyDown={(event) => {
-                          if (
-                            event.key !== "ContextMenu" &&
-                            !(event.shiftKey && event.key === "F10")
-                          )
-                            return;
-                          event.preventDefault();
-                          const bounds =
-                            event.currentTarget.getBoundingClientRect();
-                          openThreadContextMenu(
-                            thread,
-                            bounds.left + 12,
-                            bounds.bottom,
-                            event.currentTarget,
-                          );
-                        }}
-                        onPointerDown={(event) =>
-                          handleThreadPointerDown(event, thread)
-                        }
-                        onPointerMove={handleThreadPointerMove}
-                        onPointerUp={clearThreadLongPress}
-                        onPointerCancel={clearThreadLongPress}
-                      >
-                        <span className="thread-copy">
-                          <span className="thread-name">
-                            {titleFor(thread)}
+                <section className="project-group" key={group.cwd} aria-label={group.cwd || "No project"}>
+                  <div className="project-heading">
+                    {projectRenameId && group.projectId === projectRenameId ? (
+                      <form className="project-rename-form"
+                        onSubmit={(event)=>{event.preventDefault();void renameCodexProject(projectRenameId);}}>
+                        <input autoFocus aria-label="New project name" value={projectRenameValue}
+                          disabled={projectMutationBusy}
+                          onChange={(event)=>setProjectRenameValue(event.target.value)}
+                          onKeyDown={(event)=>{if(event.key==="Escape")setProjectRenameId(null);}} />
+                        <button type="submit" disabled={projectMutationBusy||!projectRenameValue.trim()}
+                          aria-label="Save project name"><Check size={14}/></button>
+                        <button type="button" aria-label="Cancel rename" onClick={()=>setProjectRenameId(null)}><X size={14}/></button>
+                      </form>
+                    ) : (
+                      <>
+                        <button type="button" className="project-heading-toggle"
+                          aria-expanded={expanded}
+                          title={group.path}
+                          onClick={()=>setProjectPreferences(current=>({
+                            ...current,collapsed:{...current.collapsed,[group.cwd]:!current.collapsed[group.cwd]},
+                          }))}>
+                          {expanded ? <ChevronDown size={14} aria-hidden="true"/> : <ChevronRight size={14} aria-hidden="true"/>}
+                          <span className="project-heading-copy">
+                            <strong>{group.name}</strong>
+                            <span className="project-path">{group.path}</span>
                           </span>
-                          <span className="thread-subtitle">
-                            {activityTime ? (
-                              <time
-                                dateTime={new Date(
-                                  activityTimestamp!,
-                                ).toISOString()}
+                          <span className="project-thread-count" aria-label={`${group.threads.length} loaded conversations`}>{group.threads.length}</span>
+                        </button>
+                        {group.projectId ? <button type="button" className="project-heading-edit"
+                          title={`Rename project ${group.name}`} aria-label={`Rename project ${group.name}`}
+                          onClick={()=>{setProjectRenameId(group.projectId);setProjectRenameValue(group.name);}}>
+                          <Pencil size={13}/>
+                        </button> : null}
+                      </>
+                    )}
+                  </div>
+                  {expanded ? <div className="project-conversations">
+                    {buildAgentTreeRows(group.threads, subagentThreads, collapsedSubagents, archivedThreads, threadSearch.toLowerCase().trim()).map(({thread, depth, childCount, expanded: agentExpanded}) => {
+                      const activityTimestamp = threadActivityTimestamp(
+                        thread,
+                        archivedThreads,
+                      );
+                      const activityTime = formatThreadActivityTime(activityTimestamp);
+                      return (
+                        <div
+                          key={thread.id}
+                          className={`thread-row ${selectedThread?.id === thread.id ? "selected" : ""} ${depth ? "thread-agent-row" : ""}`}
+                          style={{ paddingLeft: Math.min(depth, 8) * 13 }}
+                        >
+                          {childCount ? (
+                            <button
+                              type="button"
+                              className="thread-tree-toggle"
+                              aria-expanded={agentExpanded}
+                              aria-label={`${agentExpanded ? "Collapse" : "Expand"} ${childCount} subagents`}
+                              title={`${childCount} subagents`}
+                              onClick={() => setCollapsedSubagents((current) => ({ ...current, [thread.id]: !current[thread.id] }))}
+                            >
+                              {agentExpanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+                            </button>
+                          ) : <span className="thread-tree-spacer" aria-hidden="true" />}
+
+                          {renameId === thread.id ? (
+                            <form
+                              className="rename-form"
+                              onSubmit={(event) => {
+                                event.preventDefault();
+                                void saveRename(thread.id);
+                              }}
+                            >
+                              <input
+                                autoFocus
+                                value={renameValue}
+                                onChange={(event) => setRenameValue(event.target.value)}
+                                onKeyDown={(event) => {
+                                  if (event.key === "Escape") setRenameId(null);
+                                }}
+                                aria-label="Conversation name"
+                              />
+                              <button aria-label="Save name">
+                                <Check size={15} />
+                              </button>
+                            </form>
+                          ) : (
+                            <>
+                              <button
+                                className="thread-select"
+                                aria-haspopup="menu"
+                                aria-expanded={
+                                  threadContextMenu?.thread.id === thread.id
+                                }
+                                title="Right-click or long-press for conversation actions"
+                                onClick={(event) => {
+                                  handleThreadSelectClick(event, thread);
+                                }}
+                                onDoubleClick={(event) => {
+                                  event.preventDefault();
+                                  renameThread(thread);
+                                }}
+                                onContextMenu={(event) =>
+                                  handleThreadContextMenu(event, thread)
+                                }
+                                onKeyDown={(event) => {
+                                  if (
+                                    event.key !== "ContextMenu" &&
+                                    !(event.shiftKey && event.key === "F10")
+                                  )
+                                    return;
+                                  event.preventDefault();
+                                  const bounds =
+                                    event.currentTarget.getBoundingClientRect();
+                                  openThreadContextMenu(
+                                    thread,
+                                    bounds.left + 12,
+                                    bounds.bottom,
+                                    event.currentTarget,
+                                  );
+                                }}
+                                onPointerDown={(event) =>
+                                  handleThreadPointerDown(event, thread)
+                                }
+                                onPointerMove={handleThreadPointerMove}
+                                onPointerUp={clearThreadLongPress}
+                                onPointerCancel={clearThreadLongPress}
                               >
-                                {activityTime}
-                              </time>
-                            ) : null}
-                            {thread.cwd ? (
-                              <span
-                                className="thread-project"
-                                title={thread.cwd}
-                              >
-                                {projectNameFor(thread.cwd)}
-                              </span>
-                            ) : null}
-                          </span>
-                        </span>
-                      </button>
-                    </>
-                  )}
-                  {renameId !== thread.id ? (
-                    <button
-                      type="button"
-                      className="thread-row-action"
-                      aria-label={
-                        archivedThreads
-                          ? "Restore conversation"
-                          : "Archive conversation"
-                      }
-                      title={archivedThreads ? "Restore" : "Archive"}
-                      onClick={(event) => {
-                        event.stopPropagation();
-                        void archiveThread(thread);
-                      }}
-                    >
-                      <Archive size={13} aria-hidden="true" />
-                    </button>
-                  ) : null}
-                </div>
+                                {(() => {
+                                  const indicator = threadIndicator(thread, {
+                                    pendingDecision: pendingDecisionIds.has(thread.id),
+                                    activeChild: activeChildParentIds.has(thread.id),
+                                    scheduled: scheduledIndicatorIds.has(thread.id),
+                                    failedTurn: failedThreadIds.has(thread.id),
+                                  });
+                                  const marker = threadStatusPreferences[indicator.kind];
+                                  return marker.enabled ? <span
+                                    className={`thread-status-indicator thread-status-${indicator.kind}`}
+                                    style={{backgroundColor: marker.color, borderRadius: marker.shape === "circle" ? "50%" : "2px"}}
+                                    title={indicator.label}
+                                    aria-label={indicator.label}
+                                    role="img"
+                                  /> : null;
+                                })()}
+                                <span className="thread-copy">
+                                  <span className="thread-name">
+                                    {depth > 0 ? `Agent · ${agentDisplayName(thread) || titleFor(thread)}` : titleFor(thread)}
+                                  </span>
+                                  <span className="thread-subtitle">
+                                    {activityTime ? (
+                                      <time
+                                        dateTime={new Date(
+                                          activityTimestamp!,
+                                        ).toISOString()}
+                                      >
+                                        {activityTime}
+                                      </time>
+                                    ) : null}
+                                    {thread.cwd ? (
+                                      <span
+                                        className="thread-project"
+                                        title={thread.cwd}
+                                      >
+                                        {projectNameFor(thread.cwd)}
+                                      </span>
+                                    ) : null}
+                                  </span>
+                                </span>
+                              </button>
+                            </>
+                          )}
+                          {renameId !== thread.id ? (
+                            <button type="button" className="thread-row-action"
+                              aria-label={`Copy Codex thread reference for ${titleFor(thread)}`}
+                              title="Copy Codex thread reference"
+                              onClick={event=>{event.stopPropagation();void copyConversationLink(thread.id);}}>
+                              <Link2 size={13} aria-hidden="true"/>
+                            </button>
+                          ) : null}
+                          {renameId !== thread.id ? (
+                            <button
+                              type="button"
+                              className="thread-row-action"
+                              aria-label={
+                                archivedThreads
+                                  ? "Restore conversation"
+                                  : "Archive conversation"
+                              }
+                              title={archivedThreads ? "Restore" : "Archive"}
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                void archiveThread(thread);
+                              }}
+                            >
+                              <Archive size={13} aria-hidden="true" />
+                            </button>
+                          ) : null}
+                        </div>
+                      );
+                    })}
+                  </div> : null}
+                </section>
               );
             })
           )}
@@ -5536,15 +6061,18 @@ function WorkspaceApp() {
               role="status"
               aria-live="polite"
             >
-              <span className="status-dot" />
-              <span>{statusLabel(currentConnection)}</span>
+              <div className="daemon-state-main">
+                <span className="status-dot" />
+                <span>{statusLabel(currentConnection)}</span>
+              </div>
+              <SidebarQuota rpc={client} online={connection==="online"} />
             </div>
             <button
               type="button"
               className="icon-button sidebar-settings"
               aria-label="Settings"
               title="Settings"
-              onClick={() => setShowSettings(true)}
+              onClick={() => { setShowOptions(false); setShowSettings(true); }}
             >
               <Settings size={17} />
             </button>
@@ -5585,6 +6113,16 @@ function WorkspaceApp() {
                 <Pencil size={14} aria-hidden="true" />
                 <span>Rename</span>
               </button>
+              <button type="button" role="menuitem"
+                onClick={()=>{
+                  const {thread}=threadContextMenu;
+                  setThreadContextMenu(null);
+                  setProjectMoveThread(thread);
+                  setProjectMoveTarget(thread.projectId || "");
+                }}>
+                <FolderInput size={14} aria-hidden="true"/>
+                <span>Move to project…</span>
+              </button>
               <button
                 type="button"
                 role="menuitem"
@@ -5602,6 +6140,96 @@ function WorkspaceApp() {
           )
         : null}
 
+      {archiveConfirmThread ? createPortal(
+        <div className="modal-scrim settings-scrim"
+          onClick={()=>{if(!archiveMutationBusy)setArchiveConfirmThread(null);}}>
+          <div className="project-move-panel" role="alertdialog" aria-modal="true"
+            aria-labelledby="archive-confirm-title" aria-describedby="archive-confirm-description"
+            onClick={event=>event.stopPropagation()}
+            onKeyDown={event=>{if(event.key==="Escape"&&!archiveMutationBusy)setArchiveConfirmThread(null);}}>
+            <h3 id="archive-confirm-title">Archive conversation?</h3>
+            <p title={archiveConfirmThread.name||archiveConfirmThread.preview}>
+              {archiveConfirmThread.parentThreadId ? "Subagent · " : ""}
+              {archiveConfirmThread.agentNickname||titleFor(archiveConfirmThread)}
+            </p>
+            <small id="archive-confirm-description">
+              This conversation will disappear from the active list. You can restore it from Archived conversations.
+            </small>
+            <div className="project-move-actions">
+              <button type="button" autoFocus disabled={archiveMutationBusy}
+                onClick={()=>setArchiveConfirmThread(null)}>Cancel</button>
+              <button type="button" disabled={archiveMutationBusy}
+                onClick={()=>void confirmArchiveThread()}>
+                {archiveMutationBusy?"Archiving…":"Confirm archive"}
+              </button>
+            </div>
+          </div>
+        </div>,document.body
+      ):null}
+
+      {projectCreateOpen ? createPortal(
+        <div className="modal-scrim settings-scrim"
+          onClick={()=>!projectMutationBusy&&setProjectCreateOpen(false)}>
+          <form className="project-move-panel project-create-panel" role="dialog" aria-modal="true"
+            aria-labelledby="project-create-title"
+            onClick={event=>event.stopPropagation()}
+            onSubmit={event=>{event.preventDefault();void createCodexProject();}}
+            onKeyDown={event=>{if(event.key==="Escape"&&!projectMutationBusy)setProjectCreateOpen(false);}}>
+            <h3 id="project-create-title">Create Codex project</h3>
+            <label htmlFor="project-create-name">Project name</label>
+            <input id="project-create-name" autoFocus required maxLength={120}
+              value={projectCreateName} disabled={projectMutationBusy}
+              onChange={event=>setProjectCreateName(event.target.value)}
+              placeholder="e.g. Research project" />
+            <label htmlFor="project-create-root">Project root directory</label>
+            <input id="project-create-root" required autoCapitalize="off" autoCorrect="off"
+              spellCheck={false} value={projectCreateRoot} disabled={projectMutationBusy}
+              onChange={event=>setProjectCreateRoot(event.target.value)}
+              placeholder="/absolute/path/on/codex-host" />
+            <small>Enter an absolute directory path on the Codex host. This registers the root with Codex; it does not create or move files.</small>
+            <div className="project-move-actions">
+              <button type="button" disabled={projectMutationBusy}
+                onClick={()=>setProjectCreateOpen(false)}>Cancel</button>
+              <button type="submit" disabled={projectMutationBusy||!projectCreateName.trim()||!projectCreateRoot.trim()}>
+                {projectMutationBusy?"Creating…":"Create project"}
+              </button>
+            </div>
+          </form>
+        </div>,document.body
+      ):null}
+
+      {projectMoveThread ? createPortal(
+        <div className="modal-scrim settings-scrim" onClick={()=>!projectMutationBusy&&setProjectMoveThread(null)}>
+          <form className="project-move-panel" role="dialog" aria-modal="true"
+            aria-labelledby="project-move-title"
+            onClick={(event)=>event.stopPropagation()}
+            onSubmit={(event)=>{event.preventDefault();void moveConversationToProject();}}
+            onKeyDown={(event)=>{if(event.key==="Escape"&&!projectMutationBusy)setProjectMoveThread(null);}}>
+            <h3 id="project-move-title">Move conversation</h3>
+            <p title={titleFor(projectMoveThread)}>{titleFor(projectMoveThread)}</p>
+            <label htmlFor="project-move-target">Destination project</label>
+            <select id="project-move-target" value={projectMoveTarget} disabled={projectMutationBusy}
+              onChange={(event)=>setProjectMoveTarget(event.target.value)}>
+              <option value="">No project (remove from project)</option>
+              {codexProjects.map(project=>(
+                <option value={project.id} key={project.id}>{projectOptionLabel(project)}</option>
+              ))}
+            </select>
+            <small>This updates the Codex project assignment, not the conversation's working directory.</small>
+            <div className="project-move-actions">
+              <button type="button" disabled={projectMutationBusy} onClick={()=>setProjectMoveThread(null)}>Cancel</button>
+              <button type="submit" disabled={projectMutationBusy||projectMoveTarget===(projectMoveThread.projectId||"")}>
+                {projectMutationBusy?"Saving…":"Move"}
+              </button>
+            </div>
+          </form>
+        </div>,document.body
+      ):null}
+
+      <FileReferenceContext.Provider value={{
+        client,cwd:cwd||selectedThread?.cwd||"",
+        openThread:(threadId:string)=>{void navigateToThread(threadId,[],"push");},
+      }}>
       <main className="main-panel">
         <header className="topbar">
           {sidebarCollapsed ? (
@@ -5642,6 +6270,18 @@ function WorkspaceApp() {
             <ChevronDown size={14} />
           </div>
           <div className="topbar-right">
+            {selectedThread ? <button type="button" className="project-topbar-move"
+              title="Copy Codex thread reference"
+              aria-label="Copy Codex thread reference"
+              onClick={()=>void copyConversationLink(selectedThread.id)}>
+              <Link2 size={15}/> <span>Link</span>
+            </button>:null}
+            {selectedThread ? <button type="button" className="project-topbar-move"
+              title="Move this conversation to a Codex project"
+              aria-label="Move conversation to project"
+              onClick={()=>{setProjectMoveThread(selectedThread);setProjectMoveTarget(selectedThread.projectId||"");}}>
+              <FolderInput size={15}/> <span>Project</span>
+            </button>:null}
             <a
               className="browser-shortcut"
               href="/browser"
@@ -5672,6 +6312,10 @@ function WorkspaceApp() {
             </label>
           </div>
         </header>
+
+        {selectedThread && client ? <ThreadGoalPanel key={selectedThread.id}
+          client={client} threadId={selectedThread.id} revision={goalRevision}
+          onError={error=>setNotice({tone:"error",text:"Goal: "+error})}/> : null}
 
         {status.daemon.available ? null : (
           <div className="daemon-banner" role="status">
@@ -5770,7 +6414,7 @@ function WorkspaceApp() {
               Restoring conversation…
             </div>
           ) : null}
-          {!selectedThread && items.length === 0 ? (
+          {!selectedThread && items.length === 0 && visibleOptimistic.length === 0 ? (
             <div className="welcome-state">
               <div className="welcome-mark">
                 <Code2 size={23} />
@@ -5785,6 +6429,16 @@ function WorkspaceApp() {
                 Ask Codex to explore, build, or explain something in your
                 workspace.
               </p>
+              <label className="new-conversation-project">
+                <span>Project</span>
+                <select aria-label="New conversation project" value={newProjectId}
+                  onChange={event=>selectNewProject(event.target.value)}>
+                  <option value="">No project</option>
+                  {codexProjects.map(project=><option key={project.id} value={project.id}>
+                    {projectOptionLabel(project)}
+                  </option>)}
+                </select>
+              </label>
               <div className="suggestion-list">
                 <button
                   onClick={() =>
@@ -5826,6 +6480,8 @@ function WorkspaceApp() {
                   key={group.key}
                   entry={group.entry}
                   onOpenThread={openAgentThread}
+                  onFork={forkConversationAtMessage}
+                  forkBusy={forkBusy}
                 />
               );
             const openKey = `${selectedRef.current ?? "new"}:${group.key}`;
@@ -5847,6 +6503,9 @@ function WorkspaceApp() {
               />
             );
           })}
+          {visibleOptimistic.map(message=><OptimisticMessageBubble
+            key={message.id} message={message}
+            onRestore={()=>void restoreOptimistic(message)}/>)}
           {turnActive && !items.some((entry) => entry.streaming) ? (
             <div className="thinking-indicator">
               <span />
@@ -6079,8 +6738,8 @@ function WorkspaceApp() {
             {completionTarget && composerCanComplete ? (
               <div className="composer-completions" id="composer-completions">
                 <div className="composer-completions-heading">
-                  {completionTarget.kind === "file"
-                    ? "Files and folders"
+                  {completionTarget.kind === "mention"
+                    ? "Plugins and files"
                     : completionTarget.kind === "skill"
                       ? "Skills"
                       : "Commands"}
@@ -6120,16 +6779,26 @@ function WorkspaceApp() {
                         key={
                           item.kind === "command"
                             ? `${item.command}:${index}`
-                            : `${item.path}:${index}`
+                            : item.kind === "plugin"
+                              ? `plugin:${item.id}`
+                              : `${item.path}:${index}`
                         }
                         title={
-                          item.kind === "command" ? item.description : item.path
+                          item.kind === "command" ? item.description : item.kind === "plugin" ? item.description : item.path
                         }
                         onPointerDown={(event) => event.preventDefault()}
                         onMouseEnter={() => setCompletionIndex(index)}
                         onClick={() => selectCompletion(item)}
                       >
-                        {item.kind === "file" ? (
+                        {item.kind === "plugin" ? (
+                          <>
+                            <Code2 size={15} aria-hidden="true"/>
+                            <span className="composer-completion-copy">
+                              <strong>@{item.name}</strong>
+                              <small>{item.description}</small>
+                            </span>
+                          </>
+                        ) : item.kind === "file" ? (
                           <>
                             <FileText size={15} aria-hidden="true" />
                             <span className="composer-completion-copy">
@@ -6166,7 +6835,9 @@ function WorkspaceApp() {
                     <div className="composer-completion-status" role="status">
                       {completionTarget.kind === "command"
                         ? "No supported commands found."
-                        : `No ${completionTarget.kind === "file" ? "files" : "skills"} found.`}
+                        : completionTarget.kind === "mention"
+                          ? "No matching installed plugins or files."
+                          : "No skills found."}
                     </div>
                   )}
                 </div>
@@ -6202,15 +6873,15 @@ function WorkspaceApp() {
                 </label>
                 <button
                   type="button"
-                  className={`composer-tool ${showSettings ? "active" : ""}`}
+                  className={`composer-tool ${showOptions ? "active" : ""}`}
                   title="Model and permission options"
-                  aria-expanded={showSettings}
+                  aria-expanded={showOptions}
                   disabled={
                     sending ||
                     queueing ||
                     selectedThread?.canAcceptDirectInput === false
                   }
-                  onClick={() => setShowSettings((value) => !value)}
+                  onClick={() => { setShowSettings(false); setShowOptions((value) => !value); }}
                 >
                   <Shield size={16} />
                   <span className="settings-label">Options</span>
@@ -6303,11 +6974,11 @@ function WorkspaceApp() {
                 )}
               </div>
             </div>
-            {showSettings
+            {(showSettings || showOptions)
               ? createPortal(
                   <div
                     className="modal-scrim settings-scrim"
-                    onClick={() => setShowSettings(false)}
+                    onClick={() => { setShowSettings(false); setShowOptions(false); }}
                   >
                     <section
                       className="settings-panel"
@@ -6316,26 +6987,27 @@ function WorkspaceApp() {
                       aria-labelledby="settings-title"
                       onClick={(event) => event.stopPropagation()}
                       onKeyDown={(event) => {
-                        if (event.key === "Escape") setShowSettings(false);
+                        if (event.key === "Escape") { setShowSettings(false); setShowOptions(false); }
                       }}
                     >
                       <div className="settings-panel-heading">
                         <div>
-                          <strong id="settings-title">Settings</strong>
-                          <span>
-                            Run choices, device preferences, and history.
-                          </span>
+                          <strong id="settings-title">{showOptions ? "Conversation Options" : "Global Settings"}</strong>
+                          <span>{showOptions
+                            ? "Model, reasoning, permissions, and plugin preferences for this conversation."
+                            : "Codex account, usage, installed apps, device preferences, and history."}</span>
                         </div>
                         <button
                           type="button"
                           className="icon-button"
                           aria-label="Close settings"
                           autoFocus
-                          onClick={() => setShowSettings(false)}
+                          onClick={() => { setShowSettings(false); setShowOptions(false); }}
                         >
                           <X size={16} />
                         </button>
                       </div>
+                      {showOptions ? (<>
                       <h3 className="settings-section-title">Run settings</h3>
                       <div className="settings-grid">
                         <label>
@@ -6407,6 +7079,16 @@ function WorkspaceApp() {
                         </label>
                         {!selectedThread ? (
                           <label className="cwd-setting">
+                            <span>Project</span>
+                            <select aria-label="New conversation project in options" value={newProjectId}
+                              onChange={event=>selectNewProject(event.target.value)}>
+                              <option value="">No project</option>
+                              {codexProjects.map(project=><option key={project.id} value={project.id}>
+                                {projectOptionLabel(project)}
+                              </option>)}
+                            </select>
+                            <small>Saved as the official Codex project ID when this conversation starts.</small>
+                            <span>Working directory</span>
                             <span>Working directory</span>
                             <input
                               value={cwd}
@@ -6441,6 +7123,76 @@ function WorkspaceApp() {
                             )}
                           </div>
                         )}
+                      </div>
+                      <ThreadPluginOptions rpc={client} visible={showOptions && connection === "online"}
+                        threadId={selectedThread?.id || null} disabledIds={disabledPluginIds}
+                        onChange={setDisabledPluginIds} />
+                      </>) : (<>
+                      <div className="settings-preferences">
+                        <div className="settings-preference">
+                          <div>
+                            <strong>Interface language</strong>
+                            <span>Switch the interface between Chinese and English. Conversation content is unchanged.</span>
+                          </div>
+                          <label className="interface-language-field">
+                            <span className="sr-only">Language</span>
+                            <select aria-label="Interface language" value={interfaceLanguage}
+                              onChange={event=>setInterfaceLanguageChoice(event.target.value==="zh"?"zh":"en")}>
+                              <option value="zh">简体中文</option>
+                              <option value="en">English</option>
+                            </select>
+                          </label>
+                        </div>
+                      </div>
+                      <CodexAccountPlugins rpc={client} visible={showSettings && connection === "online"} />
+                      <div className="settings-preferences">
+                        <div className="thread-indicator-preference-heading">
+                          <div>
+                            <h3 className="settings-section-title">Conversation status markers</h3>
+                            <span>Configure the visibility, color and shape of each status on this device.</span>
+                          </div>
+                          <button type="button" className="settings-toggle"
+                            onClick={() => setThreadStatusPreferences(structuredClone(defaultThreadStatusPreferences))}>
+                            Reset
+                          </button>
+                        </div>
+                        {threadStatusOrder.map((kind) => (
+                          <div key={kind} className="thread-indicator-preference-row">
+                            <span className="thread-status-indicator"
+                              style={{backgroundColor: threadStatusPreferences[kind].color,
+                                borderRadius: threadStatusPreferences[kind].shape === "circle" ? "50%" : "2px"}}
+                              aria-hidden="true" />
+                            <strong>{threadStatusLabels[kind]}</strong>
+                            <label className="thread-indicator-color">
+                              <span className="sr-only">{threadStatusLabels[kind]} color</span>
+                              <input type="color" value={threadStatusPreferences[kind].color}
+                                aria-label={`${threadStatusLabels[kind]} color`}
+                                onChange={(event) => {
+                                  const color = event.target.value;
+                                  setThreadStatusPreferences((current) => ({...current, [kind]: {...current[kind],color}}));
+                                }} />
+                            </label>
+                            <label>
+                              <span className="sr-only">{threadStatusLabels[kind]} shape</span>
+                              <select aria-label={`${threadStatusLabels[kind]} shape`}
+                                value={threadStatusPreferences[kind].shape}
+                                onChange={(event) => {
+                                  const shape = event.target.value === "square" ? "square" : "circle";
+                                  setThreadStatusPreferences((current) => ({...current, [kind]: {...current[kind],shape}}));
+                                }}>
+                                <option value="circle">Circle</option>
+                                <option value="square">Square</option>
+                              </select>
+                            </label>
+                            <button type="button" className="settings-toggle"
+                              aria-label={`${threadStatusLabels[kind]} marker visibility`}
+                              aria-pressed={threadStatusPreferences[kind].enabled}
+                              onClick={() => setThreadStatusPreferences((current) => ({...current,
+                                [kind]: {...current[kind], enabled: !current[kind].enabled}}))}>
+                              {threadStatusPreferences[kind].enabled ? "On" : "Off"}
+                            </button>
+                          </div>
+                        ))}
                       </div>
                       <div className="settings-preferences">
                         <h3 className="settings-section-title">
@@ -6565,6 +7317,7 @@ function WorkspaceApp() {
                           Sign out
                         </button>
                       </div>
+                      </>)}
                     </section>
                   </div>,
                   document.body,
@@ -6573,6 +7326,7 @@ function WorkspaceApp() {
           </form>
         </div>
       </main>
+      </FileReferenceContext.Provider>
 
       {approvalPrompt ? (
         <ApprovalDialog
@@ -7036,18 +7790,30 @@ function LoginScreen({
   busy,
   error,
   onSubmit,
+  language,
+  setLanguage,
 }: {
   token: string;
   setToken: (value: string) => void;
   busy: boolean;
   error: string;
   onSubmit: (event: FormEvent<HTMLFormElement>) => void;
+  language: InterfaceLanguage;
+  setLanguage: (value: InterfaceLanguage) => void;
 }) {
   return (
     <div className="login-page">
       <div className="login-ornament ornament-one" />
       <div className="login-ornament ornament-two" />
       <div className="login-card">
+        <label className="login-language">
+          <span className="sr-only">Interface language</span>
+          <select aria-label="Interface language" value={language}
+            onChange={(event)=>setLanguage(event.target.value==="zh"?"zh":"en")}>
+            <option value="zh">简体中文</option>
+            <option value="en">English</option>
+          </select>
+        </label>
         <div className="login-brand">
           <span className="brand-mark">
             <Code2 size={18} />
@@ -7232,12 +7998,43 @@ function activityLabel(item: ThreadItem): string {
   return humanizeItemType(item.type);
 }
 
+function OptimisticMessageBubble({message,onRestore}:{
+  message:OptimisticSubmission;onRestore:()=>void;
+}){
+  const uncertain=message.status==="unconfirmed";
+  return <article className={`message-row user-row optimistic-message ${uncertain?"unconfirmed":""}`}
+    aria-label={uncertain?"Message delivery could not be confirmed":"Message submitted"}>
+    <div className="user-message-bubble">
+      {message.input.map((part,index)=>(
+        part.type==="text"?<div className="user-text" key={index}>{part.text}</div>:
+        part.type==="image" && "url" in part ?
+          <div className="optimistic-attachment" key={index}>
+            {safeImageUrl(part.url)?<img src={part.url} alt="Attached image"/>:"Image attachment"}
+          </div>:
+          part.type==="skill" ? <span className="user-chip" key={index}>Skill · {part.name}</span>:
+          part.type==="mention" ? <span className="user-chip" key={index}>@{part.name}</span>:null
+      ))}
+      <div className="optimistic-status" role="status">
+        {uncertain?"Delivery unconfirmed":message.status==="sending"
+          ? message.kind==="queue"?"Queuing…":"Sending…"
+          : "Submitted · syncing…"}
+        {uncertain?<button type="button" onClick={onRestore}>Check and restore draft</button>:null}
+      </div>
+      {uncertain&&message.error?<small className="optimistic-error">{message.error}</small>:null}
+    </div>
+  </article>;
+}
+
 function TimelineCard({
   entry,
   onOpenThread,
+  onFork,
+  forkBusy,
 }: {
   entry: TimelineItem;
   onOpenThread: (threadId: string, parentThreadId?: string) => void;
+  onFork?: (entry:TimelineItem)=>void;
+  forkBusy?: boolean;
 }) {
   const item = entry.item;
   if (item.type === "userMessage") {
@@ -7246,10 +8043,16 @@ function TimelineCard({
       : [];
     return (
       <article className="message-row user-row">
-        <div className="user-message-bubble">
-          {content.map((part, index) => (
-            <UserInputPart key={index} part={part} />
-          ))}
+        <div className="user-message-with-actions">
+          <div className="user-message-bubble">
+            {content.map((part, index) => (
+              <UserInputPart key={index} part={part} />
+            ))}
+          </div>
+          {entry.turnId ? <button type="button" className="message-fork-button"
+            disabled={forkBusy||Boolean(entry.streaming)}
+            title="Fork before this user turn"
+            onClick={()=>onFork?.(entry)}><GitBranch size={12}/> Fork here</button>:null}
         </div>
       </article>
     );
@@ -7268,6 +8071,9 @@ function TimelineCard({
             </div>
           ) : null}
           <MarkdownContent text={text} />
+          {entry.turnId && !entry.streaming ? <button type="button" className="message-fork-button"
+            disabled={forkBusy} title="Fork through this completed assistant turn"
+            onClick={()=>onFork?.(entry)}><GitBranch size={12}/> Fork here</button>:null}
           {item.delivery === "failed" ? (
             <p className="delivery-error">
               This response could not be delivered.
@@ -7516,6 +8322,8 @@ function TimelineCard({
 }
 
 function UserInputPart({ part }: { part: Record<string, unknown> }) {
+  const context=useContext(FileReferenceContext);
+  const [preview,setPreview]=useState<string|null>(null);
   if (part.type === "text")
     return <div className="user-text">{asString(part.text)}</div>;
   if (part.type === "image") {
@@ -7528,12 +8336,18 @@ function UserInputPart({ part }: { part: Record<string, unknown> }) {
       <span className="unsupported-attachment">Image attachment</span>
     );
   }
-  if (part.type === "localImage")
-    return (
-      <span className="unsupported-attachment">
-        Image · {asString(part.path).split("/").at(-1)}
-      </span>
-    );
+  if (part.type === "localImage"){
+    const path=asString(part.path);
+    const fullPath=path&&context?localReferencePath(path,context.cwd):null;
+    if(fullPath&&context?.client)return <>
+      <button type="button" className="markdown-local-link" onClick={()=>setPreview(fullPath)}>
+        Image · {path.split("/").at(-1)}
+      </button>
+      {preview?<FileReferenceViewer client={context.client} path={preview}
+        onClose={()=>setPreview(null)}/>:null}
+    </>;
+    return <span className="unsupported-attachment">Image · {path.split("/").at(-1)}</span>;
+  }
   if (part.type === "audio" || part.type === "localAudio")
     return <span className="unsupported-attachment">Audio attachment</span>;
   if (part.type === "skill")
@@ -7798,7 +8612,8 @@ function MarkdownContent({ text }: { text: string }) {
         urlTransform={safeMarkdownUrl}
         components={{
           a: MarkdownLink,
-          img: ({ alt }) => <span>{alt}</span>,
+          img: MarkdownImage,
+          pre: MarkdownCodeBlock,
         }}
       >
         {text}
@@ -7807,24 +8622,64 @@ function MarkdownContent({ text }: { text: string }) {
   );
 }
 
-function safeMarkdownUrl(value: string): string {
-  if (!value.trim()) return "";
-  try {
-    const url = new URL(value, window.location.href);
-    return ["http:", "https:"].includes(url.protocol) ? url.href : "";
-  } catch {
-    return "";
+function localReferencePath(href:string,cwd:string):string|null {
+  let path=href.trim();
+  if(!path)return null;
+  if(/^file:\/\//i.test(path)){
+    try{const u=new URL(path);if(u.hostname&&u.hostname!=="localhost")return null;path=decodeURIComponent(u.pathname);}
+    catch{return null;}
+  }else if(/^[a-z][a-z0-9+.-]*:/i.test(path))return null;
+  else{
+    path=path.split("#")[0].split("?")[0];
+    try{path=decodeURIComponent(path);}catch{return null;}
   }
+  if(path.startsWith("/") && !path.startsWith("//"))return path;
+  if(!cwd.startsWith("/")||path.startsWith("/")||path.includes("\\")||path.includes("\0"))return null;
+  const elements=(cwd+"/"+path).split("/");
+  const stack:string[]=[];
+  for(const element of elements){if(!element||element===".")continue;if(element==="..")stack.pop();else stack.push(element);}
+  return "/"+stack.join("/");
 }
-
-function MarkdownLink({ href, children }: ComponentProps<"a">) {
-  const safeHref = href ? safeMarkdownUrl(href) : "";
-  if (!safeHref) return <span>{children}</span>;
-  return (
-    <a href={safeHref} target="_blank" rel="noopener noreferrer">
-      {children}
-    </a>
-  );
+function safeMarkdownUrl(value:string):string{
+  if(!value.trim())return "";
+  if(/^codex:\/\/threads\/[a-f0-9-]{20,}$/i.test(value))return value;
+  if(/^file:\/\//i.test(value)||value.startsWith("/")||value.startsWith("./")||value.startsWith("../"))return value;
+  try{const url=new URL(value);return ["http:","https:"].includes(url.protocol)?url.href:"";}
+  catch{return (/^[\w.-]+\/[\w./-]+$/.test(value)||
+    /^[\w.-]+\.(?:md|txt|pdf|png|jpg|jpeg|webp|svg|json|csv|py|ts|tsx|js|log|yaml|yml)$/i.test(value))?value:"";}
+}
+function MarkdownLink({href,children}:ComponentProps<"a">){
+  const context=useContext(FileReferenceContext);
+  const [file,setFile]=useState<string|null>(null);
+  const value=href||"";
+  const threadId=value.match(/^codex:\/\/threads\/([a-f0-9-]{20,})/i)?.[1];
+  if(threadId && context)
+    return <button type="button" className="markdown-local-link" onClick={()=>context.openThread(threadId)}>{children}</button>;
+  const web=/^https?:\/\//i.test(value) ? safeMarkdownUrl(value):"";
+  if(web)return <a href={web} target="_blank" rel="noopener noreferrer">{children}</a>;
+  const path=context?localReferencePath(value,context.cwd):null;
+  if(path && context?.client)return <>
+    <button type="button" className="markdown-local-link" title={path}
+      onClick={()=>setFile(path)}>{children}</button>
+    {file?<FileReferenceViewer client={context.client} path={file} onClose={()=>setFile(null)}/>:null}
+  </>;
+  return <span title={value||undefined}>{children}</span>;
+}
+function MarkdownImage({src,alt}:ComponentProps<"img">){
+  const context=useContext(FileReferenceContext);
+  const [file,setFile]=useState<string|null>(null);
+  const url=safeImageUrl(src);
+  if(url)return <a href={url} target="_blank" rel="noopener noreferrer">
+    <img src={url} alt={alt||"Embedded image"} className="markdown-embedded-image" loading="lazy" referrerPolicy="no-referrer"/>
+  </a>;
+  const path=src&&context?localReferencePath(src,context.cwd):null;
+  if(path&&context?.client)return <>
+    <button type="button" className="markdown-local-link" onClick={()=>setFile(path)}>
+      Preview image: {alt||path.split("/").at(-1)}
+    </button>
+    {file?<FileReferenceViewer client={context.client} path={file} onClose={()=>setFile(null)}/>:null}
+  </>;
+  return <span title={src||undefined}>{alt||"Image reference"}</span>;
 }
 
 function ApprovalDialog({

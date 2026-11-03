@@ -70,6 +70,16 @@ export class AppServerRpc {
     return client;
   }
 
+  async call<T = JsonRecord>(method: string, params: JsonRecord = {}): Promise<T> {
+    await this.ready;
+    return this.request<T>(method, params);
+  }
+
+  async awaitTurnCompletion(threadId: string, turnId: string): Promise<{status: string}> {
+    const completed = await this.waitForTurn(threadId, turnId);
+    return { status: typeof completed.status === "string" ? completed.status : "unknown" };
+  }
+
   async startTaskTurn(task: {
     mode: "sameChat" | "newChat";
     sourceThreadId: string | null;

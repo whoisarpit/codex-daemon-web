@@ -1,4 +1,5 @@
 import type { IncomingMessage, Server } from "node:http";
+import { randomUUID } from "node:crypto";
 import type { Request } from "express";
 import { WebSocket, WebSocketServer } from "ws";
 import {
@@ -10,6 +11,7 @@ import {
 import { config } from "./config.js";
 import { connectDaemon } from "./daemon.js";
 import { notifyUserInput } from "./push.js";
+import { claimThreadWriter, releaseThreadWriter, releaseThreadWriterFor, BridgeRpcRejectedError, type ThreadOwner } from "./bridge-owner.js";
 
 const upstreamInitId = "codex-daemon-web-initialize";
 const maxBufferedBytes = 2 * 1024 * 1024;
@@ -160,6 +162,64 @@ function forwardSocketPair(browser: WebSocket, sessionId: string): void {
   let sessionExpiryTimer: ReturnType<typeof setTimeout> | undefined;
   let upstreamHeartbeatCleanup = () => {};
   const pendingMessages: string[] = [];
+  const clientThreadRequests = new Map<string, { method: string; threadId: string }>();
+  const bridgePending = new Map<string, {
+    resolve: (value: Record<string, any>) => void;
+    reject: (error: Error) => void;
+    timeout: ReturnType<typeof setTimeout>;
+  }>();
+  const completionWaiters = new Map<string, {
+    resolve: (value: {status: string}) => void;
+    reject: (error: Error) => void;
+    timeout: ReturnType<typeof setTimeout>;
+  }>();
+  const completedTurns = new Map<string, string>();
+  const cleanupWriter = () => {
+    releaseThreadWriter(owner);
+    for (const [key, pending] of bridgePending) {
+      clearTimeout(pending.timeout);
+      pending.reject(new Error("The browser's Codex connection closed"));
+      bridgePending.delete(key);
+    }
+    for (const [key, pending] of completionWaiters) {
+      clearTimeout(pending.timeout);
+      pending.reject(new Error("The browser's Codex connection closed"));
+      completionWaiters.delete(key);
+    }
+  };
+  const owner: ThreadOwner = {
+    call: (method, params) => new Promise((resolve, reject) => {
+      if (!ready || !upstream || upstream.readyState !== WebSocket.OPEN || !sessionIsValid()) {
+        reject(new Error("The browser's Codex connection is unavailable"));
+        return;
+      }
+      const id = `webui-relay:${randomUUID()}`;
+      const timeout = setTimeout(() => {
+        bridgePending.delete(id);
+        reject(new Error(`Timed out waiting for ${method}`));
+      }, 20_000);
+      timeout.unref();
+      bridgePending.set(id, { resolve, reject, timeout });
+      upstream.send(JSON.stringify({id,method,params}), (error) => {
+        if (error) {
+          const pending = bridgePending.get(id);
+          if (pending) { clearTimeout(pending.timeout); bridgePending.delete(id); reject(error); }
+        }
+      });
+    }),
+    waitForTurn: (threadId, turnId) => {
+      const key = `${threadId}:${turnId}`;
+      if (completedTurns.has(key)) return Promise.resolve({status:completedTurns.get(key)!});
+      return new Promise((resolve,reject) => {
+        const timeout = setTimeout(() => {
+          completionWaiters.delete(key);
+          reject(new Error("Timed out waiting for parent turn completion"));
+        },12*60*60*1000);
+        timeout.unref();
+        completionWaiters.set(key,{resolve,reject,timeout});
+      });
+    },
+  };
 
   const browserHeartbeatCleanup = attachHeartbeat(browser, () => {
     intentionalUpstreamClose = true;
@@ -246,10 +306,17 @@ function forwardSocketPair(browser: WebSocket, sessionId: string): void {
       browser.close(1007, "invalid JSON-RPC method");
       return;
     }
+    if ((packet.method === "thread/resume" || packet.method === "thread/start" || packet.method === "thread/unsubscribe") && packet.id !== undefined) {
+      const params = isJsonObject(packet.params) ? packet.params : {};
+      clientThreadRequests.set(JSON.stringify(packet.id),{
+        method: packet.method, threadId: typeof params.threadId === "string" ? params.threadId : "",
+      });
+    }
     safeForward(browser, upstream, text);
   });
 
   browser.on("close", () => {
+    cleanupWriter();
     if (initializeTimer) clearTimeout(initializeTimer);
     if (sessionExpiryTimer) clearTimeout(sessionExpiryTimer);
     detachRevocationListener();
@@ -326,10 +393,56 @@ function forwardSocketPair(browser: WebSocket, sessionId: string): void {
           pendingMessages.push(text);
           return;
         }
+        try {
+          const packet = JSON.parse(text) as unknown;
+          if (isJsonObject(packet)) {
+            if (packet.method === "turn/completed" && isJsonObject(packet.params)) {
+              const params = packet.params;
+              const turn = isJsonObject(params.turn) ? params.turn : {};
+              if (typeof params.threadId === "string" && typeof turn.id === "string") {
+                const key = `${params.threadId}:${turn.id}`;
+                const status = typeof turn.status === "string" ? turn.status : "unknown";
+                completedTurns.set(key,status);
+                if (completedTurns.size > 100) completedTurns.delete(completedTurns.keys().next().value!);
+                const waiter = completionWaiters.get(key);
+                if (waiter) {
+                  clearTimeout(waiter.timeout);
+                  completionWaiters.delete(key);
+                  waiter.resolve({status});
+                }
+              }
+            }
+            if (packet.id !== undefined) {
+              const bridgeId = typeof packet.id === "string" ? packet.id : "";
+              const pending = bridgePending.get(bridgeId);
+              if (pending) {
+                clearTimeout(pending.timeout);
+                bridgePending.delete(bridgeId);
+                if (isJsonObject(packet.error)) pending.reject(new BridgeRpcRejectedError(String(packet.error.message || "Codex rejected relay request")));
+                else pending.resolve(isJsonObject(packet.result) ? packet.result : {});
+                return;
+              }
+              const request = clientThreadRequests.get(JSON.stringify(packet.id));
+              if (request) {
+                clientThreadRequests.delete(JSON.stringify(packet.id));
+                if (!packet.error) {
+                  const result = isJsonObject(packet.result) ? packet.result : {};
+                  const thread = isJsonObject(result.thread) ? result.thread : {};
+                  const id = request.threadId || (typeof thread.id === "string" ? thread.id : "");
+                  if ((request.method === "thread/resume" || request.method === "thread/start") && id)
+                    claimThreadWriter(id,owner);
+                  // Unsubscribe relinquishes this connection's subscription.
+                  if (request.method === "thread/unsubscribe") releaseThreadWriterFor(request.threadId,owner);
+                }
+              }
+            }
+          }
+        } catch { /* Keep the original RPC frame forwarding behavior. */ }
         safeForward(upstream!, browser, text);
       });
 
       upstream.on("close", () => {
+        cleanupWriter();
         if (initializeTimer) clearTimeout(initializeTimer);
         upstreamHeartbeatCleanup();
         if (
